@@ -7,8 +7,15 @@ import (
 )
 
 func FetchTelemetry(labels map[string]string) string {
-	namespace := labels["namespace"]
-	pod := labels["pod"]
+	namespace := labels["exported_namespace"]
+	if namespace == "" {
+		namespace = labels["namespace"]
+	}
+
+	pod := labels["exported_pod"]
+	if pod == "" {
+		pod = labels["pod"]
+	}
 	if pod == "" {
 		pod = labels["instance"]
 	}
