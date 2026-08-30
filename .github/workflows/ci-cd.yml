@@ -3,7 +3,6 @@ name: Build, Test & Publish Container Image
 on:
   push:
     branches: [ "main" ]
-    tags: [ "v*.*.*" ]
   pull_request:
     branches: [ "main" ]
 
@@ -12,7 +11,7 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  test:
+  test-and-build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -21,16 +20,33 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: 'stable'
+          go-version-file: 'go.mod'
           cache: true
 
-      - name: Run Unit & Integration Tests
+      - name: Run go mod tidy validation
+        run: |
+          go mod tidy
+          git diff --exit-code || (echo "go.mod is not tidy" && exit 1)
+
+      - name: Run Unit Tests
         run: go test -v ./...
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
 
+      - name: Build Multi-Arch Binaries
+        run: |
+          mkdir -p bin
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/incident-commander-amd64 ./cmd/commander
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o bin/incident-commander-arm64 ./cmd/commander
+
+      - name: Upload Binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: compiled-binaries
+          path: bin/
+
   build-and-push:
-    needs: test
+    needs: test-and-build
     runs-on: ubuntu-latest
     if: github.event_name == 'push'
     permissions:
@@ -40,6 +56,12 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Download Binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: compiled-binaries
+          path: bin/
 
       - name: Set up QEMU for multi-arch build
         uses: docker/setup-qemu-action@v3
@@ -54,16 +76,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata (tags, labels) for Docker
+      - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha,format=short
+          tags: type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
