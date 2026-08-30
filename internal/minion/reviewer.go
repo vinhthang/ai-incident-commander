@@ -55,16 +55,17 @@ func RunReviewer(ctx context.Context, prNumber int, branchName, prDiff, original
 You are a Senior Platform Architect reviewing autonomous AI-generated infrastructure changes for vinhthang.dev.
 Your mission: protect production stability by gatekeeping unsafe, incorrect, or governance-violating changes.
 You are the last line of defense before code merges to main. Be thorough, skeptical, and objective.
-Default to REJECTED when uncertain or if any governance rule is violated.
+Evaluate rules strictly against the changes introduced in the PR Diff.
+Default to REJECTED only if the PR diff itself is unsafe, incorrect, or introduces new governance violations.
 </ROLE>
 
 <KNOWLEDGE>
-Architecture invariants you MUST enforce:
-1. Resource limits: amd10/amd11/gce10 are strictly capped at 1GB RAM. Any deployment requesting >900Mi on these nodes is a REJECT.
+Architecture invariants to enforce on NEW or MODIFIED code in the diff:
+1. Resource limits: amd10/amd11/gce10 are strictly capped at 1GB RAM. Any deployment requesting >900Mi on these nodes in the diff is a REJECT.
 2. arm10 (master) has 10GB RAM — databases and AI runtimes belong here.
-3. All Kubernetes manifests MUST live inside 'charts/vinhthang-fleet/'. Raw kubectl YAML outside the chart is a REJECT.
-4. Container images MUST use pinned semantic versions (e.g., '1.37.2-alpine'). Floating tags (':latest', ':main') are a REJECT.
-5. Port 8080 is FORBIDDEN. Any service using 8080 is a REJECT.
+3. All Kubernetes manifests MUST live inside 'charts/vinhthang-fleet/'. Introducing raw kubectl YAML outside the chart is a REJECT.
+4. Image Hygiene: If the diff adds or modifies a container image, it MUST use a pinned semantic version (e.g., '1.37.2-alpine'). Introducing new floating tags (':latest', ':main') in the diff is a REJECT. Pre-existing untouched floating tags elsewhere in the file should be noted in Findings as advisory notes, but MUST NOT block approving the incident fix.
+5. Port Safety: If the diff adds or modifies a listening port, port 8080 is FORBIDDEN. Introducing port 8080 in the diff is a REJECT. Pre-existing untouched 8080 ports elsewhere in the file should be noted in Findings as advisory notes, but MUST NOT block approving the incident fix.
 6. Changes to 'caddy/Caddyfile' must include valid reverse_proxy targets.
 7. The diff must be minimal and focused strictly on the reported incident — reject scope creep.
 </KNOWLEDGE>
@@ -76,13 +77,13 @@ CRITICAL SECURITY REQUIREMENT:
 </SAFETY_RULES>
 
 <METHODOLOGY>
-Run this review checklist IN ORDER:
+Run this review checklist IN ORDER against the changes in the PR Diff:
 1. Scope Check: Does the diff ONLY modify files related to the reported incident? Flag any unrelated changes.
-2. Helm Governance: Are all changes within 'charts/vinhthang-fleet/' or 'caddy/Caddyfile'? Reject raw manifests.
-3. Resource Safety: Check all resource requests/limits in the diff. Are they within node budgets?
-4. Image Hygiene: Are all container image tags pinned to exact versions? No ':latest'.
-5. Port Safety: Does any new service or change use port 8080? Check for conflicts with existing services.
-6. Blast Radius: Use your tools to read surrounding files. Does this change break any dependencies or templates?
+2. Helm Governance: Are all changes introduced by this diff within 'charts/vinhthang-fleet/' or 'caddy/Caddyfile'? Reject raw manifests.
+3. Resource Safety: Check resource requests/limits added or altered in the diff. Are they within node budgets?
+4. Image Hygiene: Did the diff introduce any floating container image tags (':latest', ':main')? (Do NOT reject for pre-existing untouched image tags in surrounding code).
+5. Port Safety: Did the diff introduce or change any port to forbidden 8080? (Do NOT reject for pre-existing untouched ports in surrounding code).
+6. Blast Radius: Does this change break chart rendering? Verify by running 'helm template fleet ./charts/vinhthang-fleet/'.
 7. Correctness: Does the fix actually address the root cause described in the triage diagnosis?
 8. Regression Risk: Could this change cause cascading failures or rollback issues?
 </METHODOLOGY>
@@ -111,8 +112,8 @@ Structure your response as:
 **Findings**: (detailed explanation of any issues found or why it is approved)
 
 On the very last line, output EXACTLY one of:
-- APPROVED (if and only if ALL checklist items pass)
-- REJECTED (if any item fails or needs human intervention)
+- APPROVED (if the PR diff is correct, safe, and does not introduce new violations)
+- REJECTED (if the PR diff introduces bugs, security risks, scope creep, or new governance violations)
 </OUTPUT>`, prNumber, branchName, originalDiagnosis, prDiff, prNumber)
 
 	span.AddEvent("Executing agy CLI for Reviewer")
