@@ -18,7 +18,7 @@ func FetchTelemetry(labels map[string]string) string {
 	}
 
 	var builder strings.Builder
-	builder.WriteString(fmt.Sprintf("Telemetry for Pod %s in Namespace %s:\n\n", pod, namespace))
+	fmt.Fprintf(&builder, "Telemetry for Pod %s in Namespace %s:\n\n", pod, namespace)
 
 	logCmd := exec.Command("kubectl", "logs", "-n", namespace, pod, "--tail=50")
 	logOutput, err := logCmd.CombinedOutput()
