@@ -1,6 +1,6 @@
 module vinhthang.dev/ai-incident-commander
 
-go 1.25.0
+go 1.24.0
 
 require (
 	github.com/google/go-github/v59 v59.0.0
