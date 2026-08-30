@@ -1,13 +1,10 @@
 # Build stage
-FROM --platform=$BUILDPLATFORM golang:alpine AS builder
-ARG TARGETOS
-ARG TARGETARCH
+FROM golang:1.24-bookworm AS builder
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-# Compile static binary for target arch
-RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -a -installsuffix cgo -o incident-commander main.go
+RUN CGO_ENABLED=0 GOOS=linux go build -o incident-commander ./cmd/commander
 
 # Run stage
 FROM debian:bookworm-slim
