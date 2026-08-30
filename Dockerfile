@@ -7,4 +7,5 @@ RUN apt-get update && apt-get install -y ca-certificates git openssh-client curl
     rm -rf /var/lib/apt/lists/*
 COPY bin/incident-commander-${TARGETARCH} /app/incident-commander
 EXPOSE 8085
+RUN chmod +x /app/incident-commander
 CMD ["/app/incident-commander"]
