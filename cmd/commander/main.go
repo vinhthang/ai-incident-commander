@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"vinhthang.dev/ai-incident-commander/internal/config"
@@ -63,24 +66,52 @@ func main() {
 	}
 
 	tp := initTracer()
-	defer func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := tp.Shutdown(ctx); err != nil {
-			log.Printf("Error shutting down tracer provider: %v", err)
-		}
-	}()
 
 	github.InitClient()
 	workspace.InitWorkspace()
 
-	http.HandleFunc("/webhook", webhook.HandleWebhook)
-	
+	mux := http.NewServeMux()
+	mux.HandleFunc("/webhook", webhook.HandleWebhook)
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8085"
 	}
-	
-	log.Printf("🚀 Modular AI Incident Commander starting on :%s (model: %s)", port, config.GeminiModel)
-	log.Fatal(http.ListenAndServe(":"+port, nil))
+
+	srv := &http.Server{
+		Addr:              ":" + port,
+		Handler:           mux,
+		ReadTimeout:       15 * time.Second,
+		ReadHeaderTimeout: 5 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
+	// Listen for OS termination signals for graceful shutdown
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+
+	go func() {
+		log.Printf("🚀 Modular AI Incident Commander starting on :%s (model: %s)", port, config.GeminiModel)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("HTTP server error: %v", err)
+		}
+	}()
+
+	// Block until signal is received
+	<-ctx.Done()
+	log.Println("Shutting down AI Incident Commander gracefully...")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("Error shutting down HTTP server: %v", err)
+	}
+
+	if err := tp.Shutdown(shutdownCtx); err != nil {
+		log.Printf("Error shutting down tracer provider: %v", err)
+	}
+
+	log.Println("AI Incident Commander stopped cleanly.")
 }

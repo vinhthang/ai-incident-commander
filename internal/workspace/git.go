@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"strings"
 
 	"vinhthang.dev/ai-incident-commander/internal/config"
 )
@@ -13,8 +14,8 @@ func InitWorkspace() {
 	_ = exec.Command("git", "config", "--global", "user.email", "ai-incident-commander@vinhthang.dev").Run()
 	_ = exec.Command("git", "config", "--global", "user.name", "AI Incident Commander").Run()
 	if config.GithubToken != "" {
-		cmd := exec.Command("sh", "-c", fmt.Sprintf("git config --global url.\"https://oauth2:%s@github.com/\".insteadOf \"https://github.com/\"", config.GithubToken))
-		_ = cmd.Run()
+		key := fmt.Sprintf("url.https://oauth2:%s@github.com/.insteadOf", config.GithubToken)
+		_ = exec.Command("git", "config", "--global", key, "https://github.com/").Run()
 	}
 
 	_ = os.MkdirAll("/app/workspace", 0755)
@@ -35,10 +36,15 @@ func InitWorkspace() {
 }
 
 func CreateAndCheckoutBranch(branchName string) error {
-	cmd := exec.Command("git", "checkout", "-b", branchName)
+	trimmed := strings.TrimSpace(branchName)
+	if trimmed == "" || trimmed == "main" || trimmed == "master" {
+		return fmt.Errorf("invalid branch name for autonomous fix: %s", branchName)
+	}
+
+	cmd := exec.Command("git", "checkout", "-b", trimmed)
 	cmd.Dir = config.WorkspaceDir
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to create branch %s: %v", branchName, err)
+		return fmt.Errorf("failed to create branch %s: %v", trimmed, err)
 	}
 	return nil
 }

@@ -50,10 +50,14 @@ func HandleWebhook(w http.ResponseWriter, r *http.Request) {
 			alertName = "UnknownAlert"
 		}
 
-		go func(bgCtx context.Context, aStatus, aName string, aLabels, aAnnotations map[string]string) {
+		go func(detachedCtx context.Context, aStatus, aName string, aLabels, aAnnotations map[string]string) {
 			if !state.AcquireIncidentLock(aName, aStatus) {
 				return // Dropped or debounced
 			}
+			// Enforce 10-minute overall lifecycle timeout to prevent leaked goroutines
+			bgCtx, cancel := context.WithTimeout(detachedCtx, 10*time.Minute)
+			defer cancel()
+
 			processAlert(bgCtx, aStatus, aName, aLabels, aAnnotations)
 		}(context.WithoutCancel(ctx), alert.Status, alertName, alert.Labels, alert.Annotations)
 	}
@@ -73,7 +77,7 @@ func processAlert(ctx context.Context, status, alertName string, labels, annotat
 	)
 
 	if status == "resolved" {
-		log.Printf("Alert %s resolved (closing tracking logic omitted for brevity in PR lifecycle mode)", alertName)
+		log.Printf("Alert %s resolved. Cleaning active incident state.", alertName)
 		span.AddEvent("Alert resolved. Tracking removed.")
 		state.StateMu.Lock()
 		delete(state.ActiveIncidents, alertName)
@@ -83,7 +87,7 @@ func processAlert(ctx context.Context, status, alertName string, labels, annotat
 
 	span.AddEvent("Fetching Telemetry")
 	telemetry := k8s.FetchTelemetry(labels)
-	
+
 	log.Printf("New alert %s. Running Triage Minion...", alertName)
 	span.AddEvent("Running Triage Minion")
 	diagnosis := minion.RunTriage(ctx, alertName, labels, annotations, telemetry)
@@ -97,7 +101,7 @@ func processAlert(ctx context.Context, status, alertName string, labels, annotat
 	span.AddEvent("Creating GitHub Issue")
 	issueTitle := fmt.Sprintf("[Alert] %s", alertName)
 	issueBody := fmt.Sprintf("## Grafana Alert: %s\n\n**Diagnosis from Triage Minion:**\n%s\n\n**Telemetry:**\n```text\n%s\n```", alertName, diagnosis, telemetry)
-	
+
 	issue, err := github.CreateIssue(issueTitle, issueBody, []string{"ai-incident"})
 	if err != nil {
 		log.Printf("Error creating issue: %v", err)
@@ -109,10 +113,10 @@ func processAlert(ctx context.Context, status, alertName string, labels, annotat
 	log.Printf("Created issue #%d. Creating branch...", issue.GetNumber())
 	span.AddEvent("Resetting Workspace")
 	workspace.ResetToMain()
-	
+
 	branchName := fmt.Sprintf("fix/alert-%d-%d", issue.GetNumber(), time.Now().Unix())
 	span.SetAttributes(attribute.String("git.branch", branchName))
-	
+
 	if err := workspace.CreateAndCheckoutBranch(branchName); err != nil {
 		log.Printf("Failed to create branch: %v", err)
 		span.RecordError(err)
@@ -128,7 +132,7 @@ func processAlert(ctx context.Context, status, alertName string, labels, annotat
 	span.AddEvent("Creating Pull Request")
 	prTitle := fmt.Sprintf("Fix for %s (Issue #%d)", alertName, issue.GetNumber())
 	prBody := fmt.Sprintf("Automated PR by AI Fixer Minion.\nCloses #%d\n\n### Fixer Logs\n```text\n%s\n```", issue.GetNumber(), fixerLogs)
-	
+
 	pr, err := github.CreatePullRequest(branchName, prTitle, prBody)
 	if err != nil {
 		log.Printf("Error creating PR: %v", err)
@@ -139,7 +143,14 @@ func processAlert(ctx context.Context, status, alertName string, labels, annotat
 
 	log.Printf("Fetching PR Diff for #%d...", pr.GetNumber())
 	span.AddEvent("Fetching PR Diff")
-	diff, _ := github.GetPullRequestDiff(pr.GetNumber())
+	diff, err := github.GetPullRequestDiff(pr.GetNumber())
+	if err != nil {
+		log.Printf("Error fetching PR diff for #%d: %v", pr.GetNumber(), err)
+		span.RecordError(err)
+		_ = github.AddIssueComment(pr.GetNumber(), fmt.Sprintf("⚠️ Unable to fetch PR diff: %v. Requesting human review.", err))
+		_ = github.AssignIssueOrPR(pr.GetNumber(), config.GithubOwner)
+		return
+	}
 
 	log.Printf("Triggering Reviewer Minion for PR #%d...", pr.GetNumber())
 	span.AddEvent("Running Reviewer Minion")
@@ -148,14 +159,20 @@ func processAlert(ctx context.Context, status, alertName string, labels, annotat
 	if approved {
 		log.Printf("PR #%d Approved! Merging...", pr.GetNumber())
 		span.AddEvent("PR Approved. Merging")
-		_ = github.MergePullRequest(pr.GetNumber())
-		_ = github.AddIssueComment(pr.GetNumber(), "✅ **Reviewer Minion Approved**: The diff looks good and addresses the triage diagnosis. Merging automatically.")
+		if mergeErr := github.MergePullRequest(pr.GetNumber()); mergeErr != nil {
+			log.Printf("Failed to auto-merge PR #%d: %v", pr.GetNumber(), mergeErr)
+			span.RecordError(mergeErr)
+			_ = github.AddIssueComment(pr.GetNumber(), fmt.Sprintf("⚠️ **Reviewer Approved**, but auto-merge failed: %v. Please merge manually.", mergeErr))
+			_ = github.AssignIssueOrPR(pr.GetNumber(), config.GithubOwner)
+		} else {
+			_ = github.AddIssueComment(pr.GetNumber(), "✅ **Reviewer Minion Approved**: The diff looks good and addresses the triage diagnosis. Merged automatically.")
+		}
 	} else {
-		log.Printf("PR #%d Rejected. Halting and assigning human...", pr.GetNumber())
+		log.Printf("PR #%d Rejected or unverified. Halting and assigning human...", pr.GetNumber())
 		span.AddEvent("PR Rejected. Assigning human.")
-		rejectionMsg := fmt.Sprintf("❌ **Reviewer Minion Rejected**: The fix is inadequate, unsafe, or introduces regressions.\n\n### Feedback\n```text\n%s\n```\n\nHalting AI automation and assigning a human for manual review.", reviewComments)
+		rejectionMsg := fmt.Sprintf("❌ **Reviewer Minion Rejected**: The fix is unverified, inadequate, or requires human oversight.\n\n### Feedback\n```text\n%s\n```\n\nHalting AI automation and assigning a human for manual review.", reviewComments)
 		_ = github.AddIssueComment(pr.GetNumber(), rejectionMsg)
 		_ = github.AssignIssueOrPR(pr.GetNumber(), config.GithubOwner)
-		_ = github.AssignIssueOrPR(issue.GetNumber(), config.GithubOwner) // Assign original issue too
+		_ = github.AssignIssueOrPR(issue.GetNumber(), config.GithubOwner)
 	}
 }
