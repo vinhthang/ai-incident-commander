@@ -64,6 +64,11 @@ func processAlert(status, alertName string, labels, annotations map[string]strin
 	log.Printf("New alert %s. Running Triage Minion...", alertName)
 	diagnosis := minion.RunTriage(alertName, labels, annotations, telemetry)
 
+	if diagnosis == "IGNORED" {
+		log.Printf("Triage Minion ignored alert %s. Halting.", alertName)
+		return
+	}
+
 	issueTitle := fmt.Sprintf("[Alert] %s", alertName)
 	issueBody := fmt.Sprintf("## Grafana Alert: %s\n\n**Diagnosis from Triage Minion:**\n%s\n\n**Telemetry:**\n```text\n%s\n```", alertName, diagnosis, telemetry)
 	
@@ -100,7 +105,7 @@ func processAlert(status, alertName string, labels, annotations map[string]strin
 	diff, _ := github.GetPullRequestDiff(pr.GetNumber())
 
 	log.Printf("Triggering Reviewer Minion for PR #%d...", pr.GetNumber())
-	approved, reviewComments := minion.RunReviewer(pr.GetNumber(), diff, diagnosis)
+	approved, reviewComments := minion.RunReviewer(pr.GetNumber(), branchName, diff, diagnosis)
 
 	if approved {
 		log.Printf("PR #%d Approved! Merging...", pr.GetNumber())

@@ -12,7 +12,19 @@ import (
 )
 
 func RunFixer(issueNumber int, branchName, alertName, diagnosis, telemetry string) string {
-	prompt := fmt.Sprintf("You are the Fixer Minion. GitHub Issue #%d reports an alert '%s'.\n\nTriage Diagnosis:\n%s\n\nTelemetry:\n%s\n\nAnalyze the repository locally on the current branch, determine the root cause, apply the required configuration or code fix, commit the changes, and push to the origin branch '%s' directly. Do NOT open a PR, just push.", issueNumber, alertName, diagnosis, telemetry, branchName)
+	prompt := fmt.Sprintf(`You are the Fixer Minion. GitHub Issue #%d reports an alert '%s'.
+
+Triage Diagnosis:
+%s
+
+Telemetry:
+%s
+
+You are running in the cloned repository on branch '%s'.
+Analyze the repository locally, determine the root cause, and apply the required configuration or code fix.
+Commit the changes and push them to the origin branch '%s'.
+Do NOT push to main. A Pull Request will be opened automatically for your branch.
+Log a summary of your actions so they can be posted as a comment on the PR.`, issueNumber, alertName, diagnosis, telemetry, branchName, branchName)
 	
 	cmd := exec.Command("/usr/local/bin/agy", "-p", prompt, "--dangerously-skip-permissions")
 	cmd.Dir = config.WorkspaceDir
