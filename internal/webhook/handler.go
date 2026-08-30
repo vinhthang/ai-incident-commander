@@ -46,7 +46,7 @@ func HandleWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("Webhook received"))
+	_, _ = w.Write([]byte("Webhook received"))
 }
 
 func processAlert(status, alertName string, labels, annotations map[string]string) {
@@ -89,7 +89,7 @@ func processAlert(status, alertName string, labels, annotations map[string]strin
 
 	log.Printf("Triggering Fixer Minion on branch %s...", branchName)
 	fixerLogs := minion.RunFixer(issue.GetNumber(), branchName, alertName, diagnosis, telemetry)
-	github.AddIssueComment(issue.GetNumber(), fixerLogs)
+	_ = github.AddIssueComment(issue.GetNumber(), fixerLogs)
 
 	log.Printf("Creating Pull Request...")
 	prTitle := fmt.Sprintf("Fix for %s (Issue #%d)", alertName, issue.GetNumber())
@@ -109,13 +109,13 @@ func processAlert(status, alertName string, labels, annotations map[string]strin
 
 	if approved {
 		log.Printf("PR #%d Approved! Merging...", pr.GetNumber())
-		github.MergePullRequest(pr.GetNumber())
-		github.AddIssueComment(pr.GetNumber(), "✅ **Reviewer Minion Approved**: The diff looks good and addresses the triage diagnosis. Merging automatically.")
+		_ = github.MergePullRequest(pr.GetNumber())
+		_ = github.AddIssueComment(pr.GetNumber(), "✅ **Reviewer Minion Approved**: The diff looks good and addresses the triage diagnosis. Merging automatically.")
 	} else {
 		log.Printf("PR #%d Rejected. Halting and assigning human...", pr.GetNumber())
 		rejectionMsg := fmt.Sprintf("❌ **Reviewer Minion Rejected**: The fix is inadequate, unsafe, or introduces regressions.\n\n### Feedback\n```text\n%s\n```\n\nHalting AI automation and assigning a human for manual review.", reviewComments)
-		github.AddIssueComment(pr.GetNumber(), rejectionMsg)
-		github.AssignIssueOrPR(pr.GetNumber(), config.GithubOwner)
-		github.AssignIssueOrPR(issue.GetNumber(), config.GithubOwner) // Assign original issue too
+		_ = github.AddIssueComment(pr.GetNumber(), rejectionMsg)
+		_ = github.AssignIssueOrPR(pr.GetNumber(), config.GithubOwner)
+		_ = github.AssignIssueOrPR(issue.GetNumber(), config.GithubOwner) // Assign original issue too
 	}
 }
