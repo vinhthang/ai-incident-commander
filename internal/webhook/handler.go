@@ -98,6 +98,34 @@ func processAlert(ctx context.Context, status, alertName string, labels, annotat
 		return
 	}
 
+	if labels["namespace"] == "apps" {
+		serviceName := labels["service"]
+		if serviceName == "" {
+			serviceName = labels["app"]
+		}
+		endpointOrTopic := labels["endpoint"]
+		if endpointOrTopic == "" {
+			endpointOrTopic = labels["topic"]
+		}
+		statusCode := labels["status_code"]
+		if statusCode == "" {
+			statusCode = "UNKNOWN"
+		}
+		traceID := labels["trace_id"]
+		if traceID == "" {
+			traceID = annotations["trace_id"]
+		}
+
+		log.Printf("Routing incident to AppFixer (Service: %s)", serviceName)
+		span.AddEvent("Routing to AppFixer")
+		err := minion.AppFixer(serviceName, endpointOrTopic, statusCode, traceID, diagnosis)
+		if err != nil {
+			log.Printf("AppFixer encountered an error: %v", err)
+			span.RecordError(err)
+		}
+		return // Do not create a GitHub issue or PR for App errors right now
+	}
+
 	span.AddEvent("Creating GitHub Issue")
 	issueTitle := fmt.Sprintf("[Alert] %s", alertName)
 	issueBody := fmt.Sprintf("## Grafana Alert: %s\n\n**Diagnosis from Triage Minion:**\n%s\n\n**Telemetry:**\n```text\n%s\n```", alertName, diagnosis, telemetry)

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"vinhthang.dev/ai-incident-commander/internal/config"
+	"vinhthang.dev/ai-incident-commander/internal/db"
 	"vinhthang.dev/ai-incident-commander/internal/github"
 	"vinhthang.dev/ai-incident-commander/internal/webhook"
 	"vinhthang.dev/ai-incident-commander/internal/workspace"
@@ -67,6 +68,7 @@ func main() {
 
 	tp := initTracer()
 
+	db.InitDB()
 	github.InitClient()
 	workspace.InitWorkspace()
 
