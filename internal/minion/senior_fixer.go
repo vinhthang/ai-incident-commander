@@ -1,18 +1,13 @@
 package minion
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"log"
-	"os"
-	"os/exec"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
 
-	"vinhthang.dev/ai-incident-commander/internal/config"
 	"vinhthang.dev/ai-incident-commander/internal/prompt"
 )
 
@@ -40,24 +35,17 @@ func RunSeniorFixer(ctx context.Context, issueNumber int, branchName, originalDi
 		return false, fmt.Sprintf("❌ Senior Fixer Minion failed to execute: %v", err)
 	}
 
-	span.AddEvent("Executing agy CLI for Senior Fixer")
-	log.Println("Executing agy CLI for Senior Fixer...")
+	span.AddEvent("Enqueueing agy CLI job for Senior Fixer")
+	log.Println("Submitting Senior Fixer job to AGY queue...")
 
-	cmd := exec.CommandContext(reviewerCtx, "/usr/local/bin/agy", "-p", p, "--dangerously-skip-permissions")
-	cmd.Dir = config.WorkspaceDir
+	result := EnqueueAgyJob(reviewerCtx, p)
+	outputStr := result.Stdout
 
-	var outBuf, errBuf bytes.Buffer
-	cmd.Stdout = io.MultiWriter(os.Stdout, &outBuf)
-	cmd.Stderr = io.MultiWriter(os.Stderr, &errBuf)
-
-	err = cmd.Run()
-	outputStr := outBuf.String()
-
-	if err != nil {
-		span.RecordError(err)
-		span.AddEvent(fmt.Sprintf("agy CLI error: %v", errBuf.String()))
-		log.Printf("Senior Fixer Minion failed: %v", err)
-		return false, fmt.Sprintf("❌ Senior Fixer Minion failed to execute: %v\n\nLogs:\n%s", err, errBuf.String())
+	if result.Err != nil {
+		span.RecordError(result.Err)
+		span.AddEvent(fmt.Sprintf("agy CLI error: %v", result.Stderr))
+		log.Printf("Senior Fixer Minion failed: %v", result.Err)
+		return false, fmt.Sprintf("❌ Senior Fixer Minion failed to execute: %v\n\nLogs:\n%s", result.Err, result.Stderr)
 	}
 
 	span.AddEvent("Parsing Senior Fixer Minion Output")

@@ -1,19 +1,14 @@
 package minion
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"log"
-	"os"
-	"os/exec"
 	"strings"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
 
-	"vinhthang.dev/ai-incident-commander/internal/config"
 	"vinhthang.dev/ai-incident-commander/internal/prompt"
 )
 
@@ -60,24 +55,17 @@ func RunReviewer(ctx context.Context, prNumber int, branchName, prDiff, original
 		return false, fmt.Sprintf("❌ Reviewer Minion failed to execute: %v", err)
 	}
 
-	span.AddEvent("Executing agy CLI for Reviewer")
-	log.Println("Executing agy CLI for Reviewer...")
+	span.AddEvent("Enqueueing agy CLI job for Reviewer")
+	log.Println("Submitting Reviewer job to AGY queue...")
 
-	cmd := exec.CommandContext(reviewerCtx, "/usr/local/bin/agy", "-p", p, "--dangerously-skip-permissions")
-	cmd.Dir = config.WorkspaceDir
+	result := EnqueueAgyJob(reviewerCtx, p)
+	outputStr := result.Stdout
 
-	var outBuf, errBuf bytes.Buffer
-	cmd.Stdout = io.MultiWriter(os.Stdout, &outBuf)
-	cmd.Stderr = io.MultiWriter(os.Stderr, &errBuf)
-
-	err = cmd.Run()
-	outputStr := outBuf.String()
-
-	if err != nil {
-		span.RecordError(err)
-		span.AddEvent(fmt.Sprintf("agy CLI error: %v", errBuf.String()))
-		log.Printf("Reviewer Minion failed: %v", err)
-		return false, fmt.Sprintf("❌ Reviewer Minion failed to execute: %v\n\nLogs:\n%s", err, errBuf.String())
+	if result.Err != nil {
+		span.RecordError(result.Err)
+		span.AddEvent(fmt.Sprintf("agy CLI error: %v", result.Stderr))
+		log.Printf("Reviewer Minion failed: %v", result.Err)
+		return false, fmt.Sprintf("❌ Reviewer Minion failed to execute: %v\n\nLogs:\n%s", result.Err, result.Stderr)
 	}
 
 	span.AddEvent("Parsing Reviewer Minion Output")

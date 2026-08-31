@@ -13,6 +13,7 @@ import (
 	"vinhthang.dev/ai-incident-commander/internal/config"
 	"vinhthang.dev/ai-incident-commander/internal/db"
 	"vinhthang.dev/ai-incident-commander/internal/github"
+	"vinhthang.dev/ai-incident-commander/internal/minion"
 	"vinhthang.dev/ai-incident-commander/internal/webhook"
 	"vinhthang.dev/ai-incident-commander/internal/workspace"
 
@@ -71,6 +72,9 @@ func main() {
 	db.InitDB()
 	github.InitClient()
 	workspace.InitWorkspace()
+
+	// Start the background worker queue for AGY to guarantee 1 execution at a time
+	minion.StartAgyWorker()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/webhook", webhook.HandleWebhook)

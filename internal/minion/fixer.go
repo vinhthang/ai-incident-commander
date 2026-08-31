@@ -1,18 +1,13 @@
 package minion
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"log"
-	"os"
-	"os/exec"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
 
-	"vinhthang.dev/ai-incident-commander/internal/config"
 	"vinhthang.dev/ai-incident-commander/internal/prompt"
 )
 
@@ -42,25 +37,18 @@ func RunFixer(ctx context.Context, issueNumber int, branchName, alertName, diagn
 		return fmt.Sprintf("❌ Fixer Minion encountered an error: %v", err)
 	}
 
-	span.AddEvent("Executing agy CLI for Fixer")
-	log.Println("Executing agy CLI for Fixer...")
+	span.AddEvent("Enqueueing agy CLI job for Fixer")
+	log.Println("Submitting Fixer job to AGY queue...")
 
-	cmd := exec.CommandContext(fixerCtx, "/usr/local/bin/agy", "-p", p, "--dangerously-skip-permissions")
-	cmd.Dir = config.WorkspaceDir
+	result := EnqueueAgyJob(fixerCtx, p)
 
-	var outBuf, errBuf bytes.Buffer
-	cmd.Stdout = io.MultiWriter(os.Stdout, &outBuf)
-	cmd.Stderr = io.MultiWriter(os.Stderr, &errBuf)
-
-	err = cmd.Run()
-
-	if err != nil {
-		span.RecordError(err)
-		span.AddEvent(fmt.Sprintf("agy CLI error: %v", errBuf.String()))
-		log.Printf("Fixer Minion failed: %v", err)
-		return fmt.Sprintf("❌ Fixer Minion encountered an error: %v\n\n### Stdout\n```\n%s\n```\n### Stderr\n```\n%s\n```", err, outBuf.String(), errBuf.String())
+	if result.Err != nil {
+		span.RecordError(result.Err)
+		span.AddEvent(fmt.Sprintf("agy CLI error: %v", result.Stderr))
+		log.Printf("Fixer Minion failed: %v", result.Err)
+		return fmt.Sprintf("❌ Fixer Minion encountered an error: %v\n\n### Stdout\n```\n%s\n```\n### Stderr\n```\n%s\n```", result.Err, result.Stdout, result.Stderr)
 	}
 
 	span.AddEvent("Fixer Minion Executed Successfully")
-	return fmt.Sprintf("✅ Fixer Minion executed successfully.\n\n### Execution Logs\n```\n%s\n```", outBuf.String())
+	return fmt.Sprintf("✅ Fixer Minion executed successfully.\n\n### Execution Logs\n```\n%s\n```", result.Stdout)
 }

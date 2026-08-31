@@ -1,20 +1,15 @@
 package minion
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"log"
-	"os"
-	"os/exec"
 	"strings"
 	"time"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 
-	"vinhthang.dev/ai-incident-commander/internal/config"
 	"vinhthang.dev/ai-incident-commander/internal/prompt"
 )
 
@@ -58,23 +53,16 @@ func RunTriage(ctx context.Context, alertName string, labels, annotations map[st
 		return "⚠️ Triage Minion encountered an error."
 	}
 
-	span.AddEvent("Executing agy CLI for Triage")
-	log.Println("Executing agy CLI for Triage...")
+	span.AddEvent("Enqueueing agy CLI job for Triage")
+	log.Println("Submitting Triage job to AGY queue...")
 
-	cmd := exec.CommandContext(triageCtx, "/usr/local/bin/agy", "-p", p, "--dangerously-skip-permissions")
-	cmd.Dir = config.WorkspaceDir
+	result := EnqueueAgyJob(triageCtx, p)
+	outputStr := result.Stdout
 
-	var outBuf, errBuf bytes.Buffer
-	cmd.Stdout = io.MultiWriter(os.Stdout, &outBuf)
-	cmd.Stderr = io.MultiWriter(os.Stderr, &errBuf)
-
-	err = cmd.Run()
-	outputStr := outBuf.String()
-
-	if err != nil {
-		span.RecordError(err)
-		span.AddEvent(fmt.Sprintf("agy CLI error: %v", errBuf.String()))
-		log.Printf("Triage Minion failed: %v", err)
+	if result.Err != nil {
+		span.RecordError(result.Err)
+		span.AddEvent(fmt.Sprintf("agy CLI error: %v", result.Stderr))
+		log.Printf("Triage Minion failed: %v", result.Err)
 		return "⚠️ Triage Minion encountered an error."
 	}
 
