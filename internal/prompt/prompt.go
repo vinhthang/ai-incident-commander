@@ -58,11 +58,12 @@ func RenderTriagePrompt(data TriageData) (string, error) {
 }
 
 type FixerData struct {
-	IssueNumber int
-	BranchName  string
-	AlertName   string
-	Diagnosis   string
-	Telemetry   string
+	IssueNumber    int
+	BranchName     string
+	AlertName      string
+	Diagnosis      string
+	Telemetry      string
+	ReviewFeedback string
 }
 
 func RenderFixerPrompt(data FixerData) (string, error) {
@@ -78,4 +79,15 @@ type ReviewerData struct {
 
 func RenderReviewerPrompt(data ReviewerData) (string, error) {
 	return renderTemplate("reviewer.tmpl", data)
+}
+
+type SeniorFixerData struct {
+	IssueNumber int
+	BranchName  string
+	Diagnosis   string
+	LocalDiff   string
+}
+
+func RenderSeniorFixerPrompt(data SeniorFixerData) (string, error) {
+	return renderTemplate("senior_fixer.tmpl", data)
 }

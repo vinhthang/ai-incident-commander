@@ -54,3 +54,13 @@ func ResetToMain() {
 	cmd.Dir = config.WorkspaceDir
 	_ = cmd.Run()
 }
+
+func GetLocalDiff(targetBranch string) (string, error) {
+	cmd := exec.Command("git", "diff", targetBranch)
+	cmd.Dir = config.WorkspaceDir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("git diff failed: %v", err)
+	}
+	return string(out), nil
+}

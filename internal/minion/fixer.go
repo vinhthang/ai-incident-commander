@@ -16,7 +16,7 @@ import (
 	"vinhthang.dev/ai-incident-commander/internal/prompt"
 )
 
-func RunFixer(ctx context.Context, issueNumber int, branchName, alertName, diagnosis, telemetry string) string {
+func RunFixer(ctx context.Context, issueNumber int, branchName, alertName, diagnosis, telemetry, reviewFeedback string) string {
 	ctx, span := tracer.Start(ctx, "RunFixer")
 	defer span.End()
 
@@ -29,11 +29,12 @@ func RunFixer(ctx context.Context, issueNumber int, branchName, alertName, diagn
 	defer cancel()
 
 	p, err := prompt.RenderFixerPrompt(prompt.FixerData{
-		IssueNumber: issueNumber,
-		BranchName:  branchName,
-		AlertName:   alertName,
-		Diagnosis:   diagnosis,
-		Telemetry:   telemetry,
+		IssueNumber:    issueNumber,
+		BranchName:     branchName,
+		AlertName:      alertName,
+		Diagnosis:      diagnosis,
+		Telemetry:      telemetry,
+		ReviewFeedback: reviewFeedback,
 	})
 	if err != nil {
 		span.RecordError(err)
