@@ -13,6 +13,7 @@ import (
 
 	"vinhthang.dev/ai-incident-commander/internal/config"
 	"vinhthang.dev/ai-incident-commander/internal/github"
+	"vinhthang.dev/ai-incident-commander/internal/incident"
 	"vinhthang.dev/ai-incident-commander/internal/k8s"
 	"vinhthang.dev/ai-incident-commander/internal/minion"
 	"vinhthang.dev/ai-incident-commander/internal/state"
@@ -76,11 +77,38 @@ func processAlert(ctx context.Context, status, alertName string, labels, annotat
 		attribute.String("alert.status", status),
 	)
 
+	target := incident.ExtractTargetResource(labels)
+	fingerprint := incident.ComputeFingerprint(alertName, labels["namespace"], target)
+
 	if status == "resolved" {
 		log.Printf("Alert %s resolved. Cleaning active incident state.", alertName)
 		span.AddEvent("Alert resolved. Tracking removed.")
+
+		closedIssue, err := incident.ResolveClusterIncident(fingerprint)
+		if err != nil {
+			log.Printf("Error resolving cluster incident %s: %v", fingerprint, err)
+		}
+		if closedIssue > 0 {
+			comment := fmt.Sprintf("✅ Alert %s (%s/%s) resolved: Cluster telemetry confirmed healthy.", alertName, labels["namespace"], target)
+			if err := github.CloseIssue(closedIssue, comment); err != nil {
+				log.Printf("Failed to close issue #%d: %v", closedIssue, err)
+			}
+		} else {
+			titlePrefix := fmt.Sprintf("[Alert] %s: %s/%s", alertName, labels["namespace"], target)
+			issue, err := github.FindOpenIssueByTitle(titlePrefix)
+			if err != nil {
+				log.Printf("Failed searching open issue by title prefix %s: %v", titlePrefix, err)
+			} else if issue != nil {
+				comment := fmt.Sprintf("✅ Alert %s (%s/%s) resolved: Cluster telemetry confirmed healthy.", alertName, labels["namespace"], target)
+				if err := github.CloseIssue(issue.GetNumber(), comment); err != nil {
+					log.Printf("Failed to close found issue #%d: %v", issue.GetNumber(), err)
+				}
+			}
+		}
+
 		state.StateMu.Lock()
 		delete(state.ActiveIncidents, alertName)
+		delete(state.ActiveIncidents, fingerprint)
 		state.StateMu.Unlock()
 		return
 	}
@@ -142,6 +170,22 @@ func processAlert(ctx context.Context, status, alertName string, labels, annotat
 	span.AddEvent("Fetching Telemetry")
 	telemetry := k8s.FetchTelemetry(labels)
 
+	if incident.IsEphemeralNodeOutage(labels, telemetry) {
+		log.Printf("Alert %s on ephemeral node %s suppressed...", alertName, labels["node"])
+		span.AddEvent("Alert suppressed due to ephemeral node outage.")
+		return
+	}
+
+	isDuplicate, existingIssue, err := incident.TrackClusterIncident(fingerprint, alertName, labels["namespace"], target)
+	if err != nil {
+		log.Printf("Error tracking cluster incident %s: %v", fingerprint, err)
+	}
+	if isDuplicate {
+		log.Printf("Duplicate alert %s detected (open in issue #%d). Incrementing count and skipping.", alertName, existingIssue)
+		span.AddEvent(fmt.Sprintf("Duplicate alert detected. Issue #%d already open.", existingIssue))
+		return
+	}
+
 	log.Printf("New alert %s. Running Triage Minion...", alertName)
 	span.AddEvent("Running Triage Minion")
 	diagnosis := minion.RunTriage(ctx, alertName, labels, annotations, telemetry)
@@ -149,11 +193,12 @@ func processAlert(ctx context.Context, status, alertName string, labels, annotat
 	if diagnosis == "IGNORED" {
 		log.Printf("Triage Minion ignored alert %s. Halting.", alertName)
 		span.AddEvent("Alert IGNORED by Triage Minion. Halting.")
+		_ = incident.RecordClusterIssue(fingerprint, alertName, labels["namespace"], target, 0, "ignored")
 		return
 	}
 
 	span.AddEvent("Creating GitHub Issue")
-	issueTitle := fmt.Sprintf("[Alert] %s", alertName)
+	issueTitle := fmt.Sprintf("[Alert] %s: %s/%s", alertName, labels["namespace"], target)
 	issueBody := fmt.Sprintf("## Grafana Alert: %s\n\n**Diagnosis from Triage Minion:**\n%s\n\n**Telemetry:**\n```text\n%s\n```", alertName, diagnosis, telemetry)
 
 	issue, err := github.CreateIssue(issueTitle, issueBody, []string{"ai-incident"})
@@ -163,6 +208,16 @@ func processAlert(ctx context.Context, status, alertName string, labels, annotat
 		return
 	}
 	span.SetAttributes(attribute.Int("github.issue", issue.GetNumber()))
+
+	_ = incident.RecordClusterIssue(fingerprint, alertName, labels["namespace"], target, issue.GetNumber(), "firing")
+	state.StateMu.Lock()
+	state.ActiveIncidents[fingerprint] = &state.IncidentState{
+		IssueNumber:  issue.GetNumber(),
+		AttemptCount: 0,
+		LastAttempt:  time.Now(),
+		Status:       "FIXING",
+	}
+	state.StateMu.Unlock()
 
 	log.Printf("Created issue #%d. Creating branch...", issue.GetNumber())
 	span.AddEvent("Resetting Workspace")

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/google/go-github/v59/github"
 	"golang.org/x/oauth2"
@@ -72,3 +73,34 @@ func AssignIssueOrPR(number int, assignee string) error {
 	_, _, err := Client.Issues.AddAssignees(context.Background(), config.GithubOwner, config.GithubRepo, number, []string{assignee})
 	return err
 }
+
+func CloseIssue(issueNumber int, comment string) error {
+	if comment != "" {
+		_ = AddIssueComment(issueNumber, comment)
+	}
+	state := "closed"
+	req := &github.IssueRequest{
+		State: &state,
+	}
+	_, _, err := Client.Issues.Edit(context.Background(), config.GithubOwner, config.GithubRepo, issueNumber, req)
+	return err
+}
+
+func FindOpenIssueByTitle(titlePrefix string) (*github.Issue, error) {
+	opts := &github.IssueListByRepoOptions{
+		State:       "open",
+		Labels:      []string{"ai-incident"},
+		ListOptions: github.ListOptions{PerPage: 50},
+	}
+	issues, _, err := Client.Issues.ListByRepo(context.Background(), config.GithubOwner, config.GithubRepo, opts)
+	if err != nil {
+		return nil, err
+	}
+	for _, issue := range issues {
+		if strings.HasPrefix(issue.GetTitle(), titlePrefix) {
+			return issue, nil
+		}
+	}
+	return nil, nil
+}
+

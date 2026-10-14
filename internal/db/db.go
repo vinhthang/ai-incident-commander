@@ -45,6 +45,18 @@ func runMigrations() {
 		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 		updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 	);
+
+	CREATE TABLE IF NOT EXISTS cluster_incidents (
+		fingerprint VARCHAR(255) PRIMARY KEY,
+		alert_name VARCHAR(255) NOT NULL,
+		namespace VARCHAR(255) NOT NULL,
+		target_resource VARCHAR(255) NOT NULL,
+		issue_number INT DEFAULT 0,
+		state VARCHAR(50) DEFAULT 'firing',
+		occurrence_count INT DEFAULT 1,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	);
 	`
 
 	_, err := DB.Exec(query)
