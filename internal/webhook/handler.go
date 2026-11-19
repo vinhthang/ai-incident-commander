@@ -2,16 +2,20 @@ package webhook
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"vinhthang.dev/ai-incident-commander/internal/config"
+	"vinhthang.dev/ai-incident-commander/internal/db"
 	"vinhthang.dev/ai-incident-commander/internal/github"
 	"vinhthang.dev/ai-incident-commander/internal/incident"
 	"vinhthang.dev/ai-incident-commander/internal/k8s"
@@ -32,6 +36,11 @@ type GrafanaAlertPayload struct {
 var tracer = otel.Tracer("ai-incident-commander/webhook")
 
 func HandleWebhook(w http.ResponseWriter, r *http.Request) {
+	if config.WebhookAuthToken != "" && !isAuthorizedBearerToken(r.Header.Get("Authorization"), config.WebhookAuthToken) {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
 	ctx, span := tracer.Start(r.Context(), "HandleWebhook")
 	defer span.End()
 
@@ -53,19 +62,80 @@ func HandleWebhook(w http.ResponseWriter, r *http.Request) {
 
 		go func(detachedCtx context.Context, aStatus, aName string, aLabels, aAnnotations map[string]string) {
 			_, _, fingerprint := computeAlertIdentity(aName, aLabels)
-			if !state.AcquireIncidentLock(fingerprint, aStatus) {
+			wasActive := false
+			lockAcquired := false
+			if aStatus == "resolved" {
+				wasActive = state.HasActiveIncident(fingerprint)
+				lockAcquired = state.AcquireResolveLock(fingerprint)
+			} else {
+				lockAcquired = state.AcquireIncidentLock(fingerprint, aStatus)
+			}
+			if !lockAcquired {
 				return // Dropped or debounced
 			}
 			// Enforce 10-minute overall lifecycle timeout to prevent leaked goroutines
 			bgCtx, cancel := context.WithTimeout(detachedCtx, 10*time.Minute)
 			defer cancel()
 
-			processAlert(bgCtx, aStatus, aName, aLabels, aAnnotations)
+			processAlert(bgCtx, aStatus, aName, aLabels, aAnnotations, wasActive)
 		}(context.WithoutCancel(ctx), alert.Status, alertName, alert.Labels, alert.Annotations)
 	}
 
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("Webhook received"))
+}
+
+// HandleHealthz reports liveness/readiness state including Postgres ping and AGY worker queue depth.
+func HandleHealthz(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	dbStatus := "disabled"
+	statusCode := http.StatusOK
+	overallStatus := "ok"
+
+	if db.DB != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		if err := db.DB.PingContext(ctx); err != nil {
+			dbStatus = "error"
+			statusCode = http.StatusServiceUnavailable
+			overallStatus = "degraded"
+		} else {
+			dbStatus = "connected"
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status":      overallStatus,
+		"db":          dbStatus,
+		"queue_depth": len(minion.AgyQueue),
+	})
+}
+
+func isAuthorizedBearerToken(authHeader, expected string) bool {
+	const prefix = "Bearer "
+	if !strings.HasPrefix(authHeader, prefix) {
+		return false
+	}
+	provided := strings.TrimPrefix(authHeader, prefix)
+	return subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) == 1
+}
+
+func isApplicationErrorAlert(labels, annotations map[string]string) bool {
+	if strings.EqualFold(strings.TrimSpace(labels["category"]), "application") {
+		return true
+	}
+	for _, key := range []string{"trace_id", "status_code", "topic"} {
+		if strings.TrimSpace(labels[key]) != "" || strings.TrimSpace(annotations[key]) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func computeAlertIdentity(alertName string, labels map[string]string) (namespace, target, fingerprint string) {
@@ -75,7 +145,7 @@ func computeAlertIdentity(alertName string, labels map[string]string) (namespace
 	return namespace, target, fingerprint
 }
 
-func processAlert(ctx context.Context, status, alertName string, labels, annotations map[string]string) {
+func processAlert(ctx context.Context, status, alertName string, labels, annotations map[string]string, wasActive bool) {
 	namespace, target, fingerprint := computeAlertIdentity(alertName, labels)
 
 	ctx, span := tracer.Start(ctx, "processAlert")
@@ -100,7 +170,7 @@ func processAlert(ctx context.Context, status, alertName string, labels, annotat
 			if err := github.CloseIssue(closedIssue, comment); err != nil {
 				log.Printf("Failed to close issue #%d: %v", closedIssue, err)
 			}
-		} else {
+		} else if wasActive {
 			titlePrefix := fmt.Sprintf("[Alert] %s: %s/%s", alertName, namespace, target)
 			issue, err := github.FindOpenIssueByTitle(titlePrefix)
 			if err != nil {
@@ -119,7 +189,7 @@ func processAlert(ctx context.Context, status, alertName string, labels, annotat
 		return
 	}
 
-	if namespace == "apps" {
+	if namespace == "apps" && isApplicationErrorAlert(labels, annotations) {
 		serviceName := labels["service"]
 		if serviceName == "" {
 			serviceName = labels["app"]
@@ -225,16 +295,29 @@ func processAlert(ctx context.Context, status, alertName string, labels, annotat
 	}
 	state.StateMu.Unlock()
 
-	log.Printf("Created issue #%d. Creating branch...", issue.GetNumber())
-	span.AddEvent("Resetting Workspace")
-	workspace.ResetToMain()
+	remediateClusterIssue(ctx, span, issue.GetNumber(), alertName, diagnosis, telemetry)
+}
 
-	branchName := fmt.Sprintf("fix/alert-%d-%d", issue.GetNumber(), time.Now().Unix())
+func remediateClusterIssue(ctx context.Context, span trace.Span, issueNumber int, alertName, diagnosis, telemetry string) {
+	workspace.Lock()
+	defer workspace.Unlock()
+
+	log.Printf("Created issue #%d. Creating branch...", issueNumber)
+	span.AddEvent("Resetting Workspace")
+	if err := workspace.ResetToMain(); err != nil {
+		log.Printf("Failed resetting workspace to main: %v", err)
+		span.RecordError(err)
+		_ = github.AssignIssueOrPR(issueNumber, config.GithubOwner)
+		return
+	}
+
+	branchName := fmt.Sprintf("fix/alert-%d-%d", issueNumber, time.Now().Unix())
 	span.SetAttributes(attribute.String("git.branch", branchName))
 
 	if err := workspace.CreateAndCheckoutBranch(branchName); err != nil {
 		log.Printf("Failed to create branch: %v", err)
 		span.RecordError(err)
+		_ = github.AssignIssueOrPR(issueNumber, config.GithubOwner)
 		return
 	}
 
@@ -246,8 +329,8 @@ func processAlert(ctx context.Context, status, alertName string, labels, annotat
 		log.Printf("Triggering Fixer Minion on branch %s (Attempt %d)...", branchName, attempt)
 		span.AddEvent(fmt.Sprintf("Running Fixer Minion (Attempt %d)", attempt))
 
-		fixerLogs := minion.RunFixer(ctx, issue.GetNumber(), branchName, alertName, diagnosis, telemetry, reviewFeedback)
-		_ = github.AddIssueComment(issue.GetNumber(), fmt.Sprintf("Attempt %d:\n%s", attempt, fixerLogs))
+		fixerLogs := minion.RunFixer(ctx, issueNumber, branchName, alertName, diagnosis, telemetry, reviewFeedback)
+		_ = github.AddIssueComment(issueNumber, fmt.Sprintf("Attempt %d:\n%s", attempt, fixerLogs))
 
 		span.AddEvent("Fetching Local Diff")
 		localDiff, err := workspace.GetLocalDiff("main")
@@ -258,7 +341,7 @@ func processAlert(ctx context.Context, status, alertName string, labels, annotat
 
 		log.Printf("Triggering Senior Fixer Minion...")
 		span.AddEvent("Running Senior Fixer")
-		sfApproved, sfComments := minion.RunSeniorFixer(ctx, issue.GetNumber(), branchName, diagnosis, localDiff)
+		sfApproved, sfComments := minion.RunSeniorFixer(ctx, issueNumber, branchName, diagnosis, localDiff)
 
 		if !sfApproved {
 			log.Printf("Senior Fixer rejected. Retrying Fixer...")
@@ -270,8 +353,8 @@ func processAlert(ctx context.Context, status, alertName string, labels, annotat
 		if !prCreated {
 			log.Printf("Creating Pull Request...")
 			span.AddEvent("Creating Pull Request")
-			prTitle := fmt.Sprintf("Fix for %s (Issue #%d)", alertName, issue.GetNumber())
-			prBody := fmt.Sprintf("Automated PR by AI Fixer Minion.\nCloses #%d", issue.GetNumber())
+			prTitle := fmt.Sprintf("Fix for %s (Issue #%d)", alertName, issueNumber)
+			prBody := fmt.Sprintf("Automated PR by AI Fixer Minion.\nCloses #%d", issueNumber)
 
 			pr, err := github.CreatePullRequest(branchName, prTitle, prBody)
 			if err != nil {
@@ -294,13 +377,28 @@ func processAlert(ctx context.Context, status, alertName string, labels, annotat
 		approved, reviewComments := minion.RunReviewer(ctx, prNumber, branchName, diff, diagnosis)
 
 		if approved {
-			log.Printf("PR #%d Approved! Merging...", prNumber)
+			log.Printf("PR #%d Approved by Reviewer! Waiting for CI check runs before merge...", prNumber)
+			ciPassed, ciSummary, ciErr := github.WaitForPRChecks(ctx, prNumber, 15*time.Second, 5*time.Minute)
+			if ciErr != nil {
+				log.Printf("Timed out or failed polling CI checks for PR #%d: %v", prNumber, ciErr)
+				_ = github.AddIssueComment(prNumber, fmt.Sprintf("⚠️ **Reviewer Approved**, but waiting for CI checks failed (%v). Please verify CI and merge manually.", ciErr))
+				_ = github.AssignIssueOrPR(prNumber, config.GithubOwner)
+				return
+			}
+			if !ciPassed {
+				log.Printf("CI checks failed on PR #%d (%s). Feeding back to Fixer...", prNumber, ciSummary)
+				reviewFeedback = ciSummary
+				_ = github.AddIssueComment(prNumber, fmt.Sprintf("⚠️ **Reviewer Approved**, but CI checks failed:\n\n```text\n%s\n```\nRetrying Fixer...", ciSummary))
+				continue
+			}
+
+			log.Printf("PR #%d Approved & CI Passed (%s)! Merging...", prNumber, ciSummary)
 			if mergeErr := github.MergePullRequest(prNumber); mergeErr != nil {
 				log.Printf("Failed to auto-merge PR #%d: %v", prNumber, mergeErr)
-				_ = github.AddIssueComment(prNumber, fmt.Sprintf("⚠️ **Reviewer Approved**, but auto-merge failed: %v. Please merge manually.", mergeErr))
+				_ = github.AddIssueComment(prNumber, fmt.Sprintf("⚠️ **Reviewer & CI Approved**, but auto-merge failed: %v. Please merge manually.", mergeErr))
 				_ = github.AssignIssueOrPR(prNumber, config.GithubOwner)
 			} else {
-				_ = github.AddIssueComment(prNumber, "✅ **Reviewer Minion Approved**: The diff looks good and addresses the triage diagnosis. Merged automatically.")
+				_ = github.AddIssueComment(prNumber, fmt.Sprintf("✅ **Reviewer Minion & CI Approved** (%s): The diff looks good and CI passed. Merged automatically.", ciSummary))
 			}
 			return
 		} else {
@@ -315,5 +413,5 @@ func processAlert(ctx context.Context, status, alertName string, labels, annotat
 		_ = github.AddIssueComment(prNumber, "❌ **AI Automation Exhausted**: Maximum retry attempts reached. Assigning a human.")
 		_ = github.AssignIssueOrPR(prNumber, config.GithubOwner)
 	}
-	_ = github.AssignIssueOrPR(issue.GetNumber(), config.GithubOwner)
+	_ = github.AssignIssueOrPR(issueNumber, config.GithubOwner)
 }

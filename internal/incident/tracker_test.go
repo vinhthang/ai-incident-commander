@@ -145,6 +145,49 @@ func TestExtractTargetResource(t *testing.T) {
 			labels:   map[string]string{},
 			expected: "cluster",
 		},
+		{
+			name: "skips fleet-kube-state-metrics scraper pod and extracts deployment",
+			labels: map[string]string{
+				"pod":        "fleet-kube-state-metrics-6b6cd74c86-fq8mj",
+				"service":    "fleet-kube-state-metrics",
+				"deployment": "vietcalendar",
+			},
+			expected: "vietcalendar",
+		},
+		{
+			name: "skips kube-state-metrics scraper pod and extracts statefulset",
+			labels: map[string]string{
+				"pod":         "kube-state-metrics-0",
+				"service":     "kube-state-metrics",
+				"statefulset": "postgres-master",
+			},
+			expected: "postgres-master",
+		},
+		{
+			name: "skips victoriametrics scraper pod and extracts job_name",
+			labels: map[string]string{
+				"pod":      "victoriametrics-0",
+				"job_name": "nightly-backup",
+			},
+			expected: "nightly-backup",
+		},
+		{
+			name: "skips scraper pod and extracts persistentvolumeclaim",
+			labels: map[string]string{
+				"pod":                   "fleet-kube-state-metrics-abc",
+				"persistentvolumeclaim": "data-pg-0",
+			},
+			expected: "data-pg-0",
+		},
+		{
+			name: "skips scraper service and falls back to http_url",
+			labels: map[string]string{
+				"pod":      "fleet-kube-state-metrics-abc",
+				"service":  "fleet-kube-state-metrics",
+				"http_url": "https://vietcalendar.vinhthang.dev/healthz",
+			},
+			expected: "vietcalendar.vinhthang.dev/healthz",
+		},
 	}
 
 	for _, tc := range tests {

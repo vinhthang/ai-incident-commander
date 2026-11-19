@@ -68,3 +68,32 @@ func TestConcurrentDistinctFingerprintsDoNotCollide(t *testing.T) {
 		t.Errorf("Expected duplicate lock acquisition for fp-endpoint-a to fail while active")
 	}
 }
+
+func TestAcquireResolveLock_RestartSafeAndDebounced(t *testing.T) {
+	resetState()
+	ClearResolveDebounceForTest()
+
+	// Ensure existing unresolved GhostAlert contract still holds
+	if AcquireIncidentLock("GhostAlert", "resolved") {
+		t.Fatalf("AcquireIncidentLock must still return false for unknown resolved key")
+	}
+
+	// Restart-safe resolve lock must succeed even when ActiveIncidents is empty
+	if !AcquireResolveLock("RestartedPodAlert") {
+		t.Fatalf("expected AcquireResolveLock to succeed for first resolved delivery after restart")
+	}
+
+	// Second delivery within 1-minute debounce must be suppressed
+	if AcquireResolveLock("RestartedPodAlert") {
+		t.Fatalf("expected AcquireResolveLock to debounce immediate duplicate resolved delivery")
+	}
+
+	// Simulate expired debounce window (> 1 minute ago)
+	StateMu.Lock()
+	resolvedDebounce["RestartedPodAlert"] = time.Now().Add(-2 * time.Minute)
+	StateMu.Unlock()
+
+	if !AcquireResolveLock("RestartedPodAlert") {
+		t.Fatalf("expected AcquireResolveLock to succeed after debounce window expired")
+	}
+}

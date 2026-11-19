@@ -3,6 +3,8 @@ package k8s
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -92,4 +94,70 @@ func TestFetchTelemetry_CaddyHostLabel_ActiveTLSProbe(t *testing.T) {
 		t.Fatalf("expected Server: Caddy in telemetry probe, got: %s", result)
 	}
 }
+
+func TestFetchTelemetry_SkipsScraperPodAndUsesWorkload(t *testing.T) {
+	tmpDir := t.TempDir()
+	logFile := filepath.Join(tmpDir, "kubectl_calls.log")
+	t.Setenv("KUBECTL_LOG_FILE", logFile)
+
+	kubectlScript := `#!/bin/sh
+echo "$*" >> "$KUBECTL_LOG_FILE"
+case "$1 $2" in
+  "describe deployment")
+    echo "Name: vietcalendar"
+    echo "Replicas: 1 desired | 0 available | 1 unavailable"
+    ;;
+  "get pods")
+    echo "NAME                           READY   STATUS             RESTARTS   AGE"
+    echo "vietcalendar-79d86cc9c-abcde   0/1     ImagePullBackOff   0          5m"
+    ;;
+  "get events")
+    echo "5m   Warning   FailedScheduling   pod/vietcalendar-79d86cc9c-abcde   Failed to pull image"
+    ;;
+esac
+`
+	kubectlPath := filepath.Join(tmpDir, "kubectl")
+	if err := os.WriteFile(kubectlPath, []byte(kubectlScript), 0755); err != nil {
+		t.Fatalf("failed to write fake kubectl: %v", err)
+	}
+	t.Setenv("PATH", tmpDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	labels := map[string]string{
+		"alertname":          "DeploymentReplicasUnavailable",
+		"category":           "workload",
+		"exported_namespace": "apps",
+		"namespace":          "observability",
+		"pod":                "fleet-kube-state-metrics-6b6cd74c86-fq8mj",
+		"service":            "fleet-kube-state-metrics",
+		"deployment":         "vietcalendar",
+	}
+
+	result := FetchTelemetry(labels)
+
+	callsBytes, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatalf("expected kubectl to be invoked, err=%v", err)
+	}
+	calls := string(callsBytes)
+
+	if strings.Contains(calls, "fleet-kube-state-metrics") {
+		t.Fatalf("expected FetchTelemetry NOT to query scraper pod fleet-kube-state-metrics, calls:\n%s", calls)
+	}
+	if !strings.Contains(calls, "describe deployment vietcalendar -n apps") {
+		t.Fatalf("expected kubectl describe deployment vietcalendar -n apps, calls:\n%s", calls)
+	}
+	if !strings.Contains(calls, "get pods -n apps -l app=vietcalendar") {
+		t.Fatalf("expected kubectl get pods -n apps -l app=vietcalendar, calls:\n%s", calls)
+	}
+	if !strings.Contains(calls, "get events -n apps --sort-by=.lastTimestamp") {
+		t.Fatalf("expected kubectl get events -n apps --sort-by=.lastTimestamp, calls:\n%s", calls)
+	}
+	if !strings.Contains(result, "Replicas: 1 desired | 0 available") {
+		t.Fatalf("expected deployment describe output in telemetry, got:\n%s", result)
+	}
+	if !strings.Contains(result, "ImagePullBackOff") {
+		t.Fatalf("expected pod status output in telemetry, got:\n%s", result)
+	}
+}
+
 

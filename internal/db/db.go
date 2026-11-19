@@ -64,5 +64,20 @@ func runMigrations() {
 		log.Fatalf("🚨 [Database] Failed to run migrations: %v", err)
 	}
 
+	cleanupQuery := `
+	DELETE FROM application_incidents
+	WHERE (service_name LIKE 'fleet-kube-state-metrics%' OR service_name LIKE 'kube-state-metrics%')
+	  AND endpoint_or_topic = ''
+	  AND state = 'open';
+
+	UPDATE cluster_incidents
+	SET state = 'resolved', updated_at = CURRENT_TIMESTAMP
+	WHERE target_resource LIKE 'fleet-kube-state-metrics%'
+	  AND state = 'firing';
+	`
+	if _, err := DB.Exec(cleanupQuery); err != nil {
+		log.Printf("⚠️ [Database] Failed to run stale scraper cleanup: %v", err)
+	}
+
 	log.Println("✅ [Database] Schema migrations applied successfully.")
 }

@@ -16,7 +16,7 @@ Layer 1 Edge Daemons & Ingress Endpoints:
 - gce10 (:8088/anon/): Standalone upload-server for router logs and archives (proxy on 8088, backend on 8089).
 - gce10 (:3000): Web Reader bilingual book reader app (Next.js systemd service).
 - amd10 (:3000): AdGuard Home DNS & HTTP management UI.
-- arm10 (NodePort 30006, port 8087): VietCalendar stateless service (vietcalendar.vinhthang.dev, api.vinhthang.dev).
+- amd11 (NodePort 30006, port 8087): VietCalendar stateless service (vietcalendar.vinhthang.dev, api.vinhthang.dev).
 - Edge Caddy (caddy/Caddyfile): Routes public subdomains to arm10 NodePorts (30001-30016) or edge daemons.
 
 Common false positive patterns to IGNORE:

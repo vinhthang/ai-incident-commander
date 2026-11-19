@@ -6,12 +6,15 @@ import (
 )
 
 var (
-	GithubToken  = os.Getenv("GITHUB_TOKEN")
-	GeminiAPIKey = os.Getenv("GEMINI_API_KEY")
-	GeminiModel  = GetEnv("GEMINI_MODEL", "gemini-3.5-flash")
-	ListenPort   = GetEnv("PORT", "8085")
-	GithubOwner  = GetEnv("GITHUB_OWNER", "vinhthang")
-	GithubRepo   = GetEnv("GITHUB_REPO", "oci")
+	GithubToken      = os.Getenv("GITHUB_TOKEN")
+	GeminiAPIKey     = os.Getenv("GEMINI_API_KEY")
+	GeminiModel      = GetEnv("GEMINI_MODEL", "gemini-3.5-flash")
+	AgyModel         = GetEnv("AGY_MODEL", GetEnv("GEMINI_MODEL", "gemini-3.8-flash-medium"))
+	AgyHostAuthDir   = os.Getenv("AGY_HOST_AUTH_DIR")
+	WebhookAuthToken = os.Getenv("WEBHOOK_AUTH_TOKEN")
+	ListenPort       = GetEnv("PORT", "8085")
+	GithubOwner      = GetEnv("GITHUB_OWNER", "vinhthang")
+	GithubRepo       = GetEnv("GITHUB_REPO", "oci")
 
 	WorkspaceDir = GetEnv("WORKSPACE_DIR", "/app/workspace/oci")
 	CooldownMins = 5 * time.Minute

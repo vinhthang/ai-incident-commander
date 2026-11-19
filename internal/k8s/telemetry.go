@@ -9,15 +9,18 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+
+	"vinhthang.dev/ai-incident-commander/internal/incident"
 )
 
 // FetchTelemetry gathers diagnostic information for an incident based on alert labels.
-// It supports both in-cluster Kubernetes pods (logs, events) and Layer 1 edge services/probes (HTTP/TLS active probes, node context).
+// It supports both in-cluster Kubernetes workloads/pods (logs, describe, events) and Layer 1 edge services/probes.
 func FetchTelemetry(labels map[string]string) string {
 	var builder strings.Builder
 
 	targetURL := extractTargetURL(labels)
-	hasK8sPod := (labels["pod"] != "" || labels["exported_pod"] != "")
+	namespace := incident.ExtractNamespace(labels)
+	pod := resolveTargetPod(labels)
 
 	// 1. Layer 1 Synthetic / Edge HTTP Probe Tier
 	if targetURL != "" {
@@ -29,7 +32,7 @@ func FetchTelemetry(labels map[string]string) string {
 		if node := labels["node"]; node != "" {
 			fmt.Fprintf(&builder, "Target Edge Node: %s\n", node)
 		}
-		if svc := labels["service"]; svc != "" {
+		if svc := labels["service"]; svc != "" && !incident.IsMetricsScraperLabel(svc) {
 			fmt.Fprintf(&builder, "Target Service: %s\n", svc)
 		}
 		if job := labels["job"]; job != "" {
@@ -38,33 +41,18 @@ func FetchTelemetry(labels map[string]string) string {
 		builder.WriteString("\n")
 	}
 
-	// 2. Kubernetes Pod Tier
-	if hasK8sPod {
-		namespace := labels["exported_namespace"]
-		if namespace == "" {
-			namespace = labels["namespace"]
-		}
-		pod := labels["exported_pod"]
-		if pod == "" {
-			pod = labels["pod"]
-		}
-
-		if namespace != "" && pod != "" {
-			fmt.Fprintf(&builder, "Telemetry for Pod %s in Namespace %s:\n\n", pod, namespace)
-
-			logCmd := exec.Command("kubectl", "logs", "-n", namespace, pod, "--tail=50")
-			logOutput, err := logCmd.CombinedOutput()
-			if err == nil {
-				builder.WriteString("=== Recent Logs ===\n")
-				builder.WriteString(string(logOutput) + "\n\n")
-			}
-
-			evtCmd := exec.Command("kubectl", "get", "events", "-n", namespace, "--field-selector", "involvedObject.name="+pod)
-			evtOutput, err := evtCmd.CombinedOutput()
-			if err == nil {
-				builder.WriteString("=== Recent Events ===\n")
-				builder.WriteString(string(evtOutput) + "\n\n")
-			}
+	// 2. Kubernetes Pod Tier (never query Prometheus scraper pods like fleet-kube-state-metrics)
+	if namespace != "" && pod != "" {
+		fmt.Fprintf(&builder, "Telemetry for Pod %s in Namespace %s:\n\n", pod, namespace)
+		appendKubectlTelemetry(&builder, "Recent Logs", 0, "logs", "-n", namespace, pod, "--tail=50")
+		appendKubectlTelemetry(&builder, "Recent Events", 0, "get", "events", "-n", namespace, "--field-selector", "involvedObject.name="+pod)
+	} else if namespace != "" {
+		// 3. Workload Tier fallback (Deployment / StatefulSet) when pod is absent or shadowed by a scraper label
+		if kind, name := resolveTargetWorkload(labels); kind != "" && name != "" {
+			fmt.Fprintf(&builder, "Telemetry for %s %s in Namespace %s:\n\n", kind, name, namespace)
+			appendKubectlTelemetry(&builder, "Describe "+kind, 0, "describe", kind, name, "-n", namespace)
+			appendKubectlTelemetry(&builder, "Workload Pods", 0, "get", "pods", "-n", namespace, "-l", "app="+name)
+			appendKubectlTelemetry(&builder, "Recent Namespace Events", 30, "get", "events", "-n", namespace, "--sort-by=.lastTimestamp")
 		}
 	}
 
@@ -73,6 +61,52 @@ func FetchTelemetry(labels map[string]string) string {
 	}
 
 	return builder.String()
+}
+
+func resolveTargetPod(labels map[string]string) string {
+	if p := labels["exported_pod"]; p != "" && !incident.IsMetricsScraperLabel(p) {
+		return p
+	}
+	if p := labels["pod"]; p != "" && !incident.IsMetricsScraperLabel(p) {
+		return p
+	}
+	return ""
+}
+
+func resolveTargetWorkload(labels map[string]string) (string, string) {
+	if dep := labels["deployment"]; dep != "" {
+		return "deployment", dep
+	}
+	if sts := labels["statefulset"]; sts != "" {
+		return "statefulset", sts
+	}
+	return "", ""
+}
+
+func appendKubectlTelemetry(builder *strings.Builder, heading string, maxTailLines int, args ...string) {
+	cmd := exec.Command("kubectl", args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return
+	}
+	text := string(output)
+	if maxTailLines > 0 {
+		text = tailLines(text, maxTailLines)
+	}
+	fmt.Fprintf(builder, "=== %s ===\n", heading)
+	builder.WriteString(text)
+	if !strings.HasSuffix(text, "\n") {
+		builder.WriteString("\n")
+	}
+	builder.WriteString("\n")
+}
+
+func tailLines(s string, maxLines int) string {
+	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	if len(lines) <= maxLines {
+		return strings.Join(lines, "\n")
+	}
+	return strings.Join(lines[len(lines)-maxLines:], "\n")
 }
 
 func extractTargetURL(labels map[string]string) string {

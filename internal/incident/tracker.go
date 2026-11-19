@@ -25,12 +25,39 @@ func ExtractNamespace(labels map[string]string) string {
 	return labels["namespace"]
 }
 
+// IsMetricsScraperLabel reports whether val identifies a Prometheus metrics scraper
+// pod or service label that shadows the actual Kubernetes workload target.
+func IsMetricsScraperLabel(val string) bool {
+	lower := strings.ToLower(strings.TrimSpace(val))
+	return strings.HasPrefix(lower, "fleet-kube-state-metrics") ||
+		strings.HasPrefix(lower, "kube-state-metrics") ||
+		strings.HasPrefix(lower, "victoriametrics")
+}
+
 // ExtractTargetResource determines the primary target resource from alert labels.
-// Priority order: exported_pod > pod > statefulset > deployment > service > app > http_url > endpoint > url > host > node > instance > "cluster".
+// Priority order: exported_pod > non-scraper pod > statefulset > deployment > job_name > persistentvolumeclaim > non-scraper service > non-scraper app > http_url > endpoint > url > host > node > instance > "cluster".
 func ExtractTargetResource(labels map[string]string) string {
-	keys := []string{"exported_pod", "pod", "statefulset", "deployment", "service", "app", "http_url", "endpoint", "url", "host", "node", "instance"}
+	keys := []string{
+		"exported_pod",
+		"pod",
+		"statefulset",
+		"deployment",
+		"job_name",
+		"persistentvolumeclaim",
+		"service",
+		"app",
+		"http_url",
+		"endpoint",
+		"url",
+		"host",
+		"node",
+		"instance",
+	}
 	for _, k := range keys {
 		if val, ok := labels[k]; ok && val != "" {
+			if (k == "pod" || k == "service" || k == "app") && IsMetricsScraperLabel(val) {
+				continue
+			}
 			if k == "http_url" || k == "url" {
 				return cleanURLTarget(val)
 			}

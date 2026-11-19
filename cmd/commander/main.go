@@ -63,8 +63,8 @@ func initTracer() *sdktrace.TracerProvider {
 }
 
 func main() {
-	if config.GithubToken == "" || config.GeminiAPIKey == "" {
-		log.Println("WARNING: GITHUB_TOKEN or GEMINI_API_KEY is not set. API calls will fail.")
+	if config.GithubToken == "" {
+		log.Println("WARNING: GITHUB_TOKEN is not set. GitHub API calls will fail.")
 	}
 
 	tp := initTracer()
@@ -78,6 +78,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/webhook", webhook.HandleWebhook)
+	mux.HandleFunc("/healthz", webhook.HandleHealthz)
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -98,7 +99,7 @@ func main() {
 	defer stop()
 
 	go func() {
-		log.Printf("🚀 Modular AI Incident Commander starting on :%s (model: %s)", port, config.GeminiModel)
+		log.Printf("🚀 Modular AI Incident Commander starting on :%s (model: %s)", port, config.AgyModel)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("HTTP server error: %v", err)
 		}

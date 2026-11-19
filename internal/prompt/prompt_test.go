@@ -81,11 +81,11 @@ func TestRenderPrompts_AccurateClusterTopology(t *testing.T) {
 		}
 	}
 
-	if !strings.Contains(triageRendered, "8087") || !strings.Contains(triageRendered, "30006") {
-		t.Errorf("triage prompt must document VietCalendar on port 8087 / NodePort 30006, got:\n%s", triageRendered)
+	if !strings.Contains(triageRendered, "amd11 (NodePort 30006, port 8087)") {
+		t.Errorf("triage prompt must document VietCalendar on amd11 (NodePort 30006, port 8087), got:\n%s", triageRendered)
 	}
-	if strings.Contains(triageRendered, "amd10 (:8080)") {
-		t.Errorf("triage prompt still lists stale amd10 (:8080) for VietCalendar")
+	if strings.Contains(triageRendered, "arm10 (NodePort 30006, port 8087)") || strings.Contains(triageRendered, "amd10 (:8080)") {
+		t.Errorf("triage prompt still lists stale host for VietCalendar")
 	}
 	if !strings.Contains(fixerRendered, "30001-30016") {
 		t.Errorf("fixer prompt must document NodePort range 30001-30016, got:\n%s", fixerRendered)

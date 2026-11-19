@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/google/go-github/v59/github"
 	"golang.org/x/oauth2"
@@ -102,5 +103,105 @@ func FindOpenIssueByTitle(titlePrefix string) (*github.Issue, error) {
 		}
 	}
 	return nil, nil
+}
+
+// EvaluateCheckRuns inspects a snapshot of GitHub check runs on a PR head commit.
+// It returns done=true once checks finish or fail, passed=true only if >=1 run exists
+// and every completed check concluded with success, neutral, or skipped.
+func EvaluateCheckRuns(runs []*github.CheckRun) (done bool, passed bool, summary string) {
+	if len(runs) == 0 {
+		return false, false, "waiting for CI check runs to start"
+	}
+
+	var pending []string
+	var failures []string
+
+	for _, cr := range runs {
+		if cr == nil {
+			continue
+		}
+		name := cr.GetName()
+		if name == "" {
+			name = "unnamed-check"
+		}
+		if cr.GetStatus() != "completed" {
+			pending = append(pending, fmt.Sprintf("%s (%s)", name, cr.GetStatus()))
+			continue
+		}
+
+		conclusion := cr.GetConclusion()
+		switch conclusion {
+		case "success", "neutral", "skipped":
+		default:
+			detail := ""
+			if out := cr.GetOutput(); out != nil {
+				if out.GetTitle() != "" {
+					detail = out.GetTitle()
+				} else if out.GetSummary() != "" {
+					detail = out.GetSummary()
+				}
+			}
+			if detail != "" {
+				failures = append(failures, fmt.Sprintf("%s (%s: %s)", name, conclusion, detail))
+			} else {
+				failures = append(failures, fmt.Sprintf("%s (%s)", name, conclusion))
+			}
+		}
+	}
+
+	if len(failures) > 0 {
+		return true, false, fmt.Sprintf("CI checks failed: %s", strings.Join(failures, "; "))
+	}
+	if len(pending) > 0 {
+		return false, false, fmt.Sprintf("waiting for CI check runs: %s", strings.Join(pending, ", "))
+	}
+	return true, true, fmt.Sprintf("all %d CI check runs passed", len(runs))
+}
+
+// WaitForPRChecks polls GitHub Check Runs for the PR head commit until all checks
+// pass, any check fails, or timeout elapses.
+func WaitForPRChecks(ctx context.Context, prNumber int, pollInterval, timeout time.Duration) (bool, string, error) {
+	if pollInterval <= 0 {
+		pollInterval = 15 * time.Second
+	}
+	if timeout <= 0 {
+		timeout = 5 * time.Minute
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	pr, _, err := Client.PullRequests.Get(waitCtx, config.GithubOwner, config.GithubRepo, prNumber)
+	if err != nil {
+		return false, "", fmt.Errorf("fetch PR #%d: %w", prNumber, err)
+	}
+	headSHA := pr.GetHead().GetSHA()
+	if headSHA == "" {
+		return false, "", fmt.Errorf("PR #%d has empty head SHA", prNumber)
+	}
+
+	lastSummary := "waiting for CI check runs to start"
+	for {
+		res, _, err := Client.Checks.ListCheckRunsForRef(waitCtx, config.GithubOwner, config.GithubRepo, headSHA, &github.ListCheckRunsOptions{
+			ListOptions: github.ListOptions{PerPage: 100},
+		})
+		if err != nil {
+			return false, lastSummary, fmt.Errorf("list check runs for PR #%d (%s): %w", prNumber, headSHA, err)
+		}
+
+		done, passed, summary := EvaluateCheckRuns(res.CheckRuns)
+		lastSummary = summary
+		if done {
+			return passed, summary, nil
+		}
+
+		timer := time.NewTimer(pollInterval)
+		select {
+		case <-waitCtx.Done():
+			timer.Stop()
+			return false, lastSummary, waitCtx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
