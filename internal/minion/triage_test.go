@@ -122,3 +122,71 @@ func TestParseReviewDecision(t *testing.T) {
 		})
 	}
 }
+
+func TestParseTriageDecision(t *testing.T) {
+	tests := []struct {
+		name               string
+		input              string
+		expectedAction     TriageAction
+		expectedConfidence string
+	}{
+		{
+			name:               "explicit VERDICT IGNORE",
+			input:              "## Diagnostic Report\n**Confidence**: HIGH\n\nVERDICT: IGNORE",
+			expectedAction:     ActionIgnore,
+			expectedConfidence: "HIGH",
+		},
+		{
+			name:               "legacy IGNORED still maps to IGNORE",
+			input:              "Synthetic alert.\n\nIGNORED",
+			expectedAction:     ActionIgnore,
+			expectedConfidence: "UNKNOWN",
+		},
+		{
+			name:               "HIGH confidence allows FIX_VIA_PR",
+			input:              "## Diagnostic Report\n**Confidence**: HIGH\n\nVERDICT: FIX_VIA_PR",
+			expectedAction:     ActionFixViaPR,
+			expectedConfidence: "HIGH",
+		},
+		{
+			name:               "MEDIUM confidence downgrades FIX_VIA_PR to ESCALATE_HUMAN",
+			input:              "## Diagnostic Report\n**Confidence**: MEDIUM\n\nVERDICT: FIX_VIA_PR",
+			expectedAction:     ActionEscalateHuman,
+			expectedConfidence: "MEDIUM",
+		},
+		{
+			name:               "LOW confidence downgrades FIX_VIA_PR to ESCALATE_HUMAN",
+			input:              "## Diagnostic Report\n**Confidence**: LOW\n\nVERDICT: FIX_VIA_PR",
+			expectedAction:     ActionEscalateHuman,
+			expectedConfidence: "LOW",
+		},
+		{
+			name:               "missing confidence downgrades FIX_VIA_PR to ESCALATE_HUMAN",
+			input:              "## Diagnostic Report\nVERDICT: FIX_VIA_PR",
+			expectedAction:     ActionEscalateHuman,
+			expectedConfidence: "UNKNOWN",
+		},
+		{
+			name:               "explicit ESCALATE_HUMAN",
+			input:              "## Diagnostic Report\n**Confidence**: HIGH\n\nVERDICT: ESCALATE_HUMAN",
+			expectedAction:     ActionEscalateHuman,
+			expectedConfidence: "HIGH",
+		},
+		{
+			name:               "ambiguous output defaults safely to ESCALATE_HUMAN",
+			input:              "Unable to determine exact root cause from logs.",
+			expectedAction:     ActionEscalateHuman,
+			expectedConfidence: "UNKNOWN",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			action, confidence := ParseTriageDecision(tc.input)
+			if action != tc.expectedAction || confidence != tc.expectedConfidence {
+				t.Errorf("ParseTriageDecision() = (%q, %q), expected (%q, %q)",
+					action, confidence, tc.expectedAction, tc.expectedConfidence)
+			}
+		})
+	}
+}

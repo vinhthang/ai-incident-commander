@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -157,6 +158,174 @@ esac
 	}
 	if !strings.Contains(result, "ImagePullBackOff") {
 		t.Fatalf("expected pod status output in telemetry, got:\n%s", result)
+	}
+}
+
+func TestCheckWorkloadStatus_DetectsActiveRolloutAndRecovery(t *testing.T) {
+	t.Run("active deployment rollout detected", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		kubectlScript := `#!/bin/sh
+cat <<'EOF'
+{
+  "metadata": {"name": "vietcalendar", "generation": 4},
+  "spec": {"replicas": 1},
+  "status": {
+    "observedGeneration": 3,
+    "replicas": 2,
+    "updatedReplicas": 1,
+    "readyReplicas": 0,
+    "availableReplicas": 0,
+    "conditions": [{"type": "Progressing", "status": "True", "reason": "ReplicaSetUpdated"}]
+  }
+}
+EOF
+`
+		if err := os.WriteFile(filepath.Join(tmpDir, "kubectl"), []byte(kubectlScript), 0755); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("PATH", tmpDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+		status := CheckWorkloadStatus(map[string]string{
+			"alertname":          "DeploymentReplicasUnavailable",
+			"exported_namespace": "apps",
+			"deployment":         "vietcalendar",
+		})
+		if !status.InProgress {
+			t.Fatalf("expected InProgress=true during active rollout, got: %+v", status)
+		}
+		if status.Recovered {
+			t.Fatalf("expected Recovered=false during active rollout, got: %+v", status)
+		}
+	})
+
+	t.Run("healthy post-soak deployment marked recovered", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		kubectlScript := `#!/bin/sh
+cat <<'EOF'
+{
+  "metadata": {"name": "vietcalendar", "generation": 4},
+  "spec": {"replicas": 1},
+  "status": {
+    "observedGeneration": 4,
+    "replicas": 1,
+    "updatedReplicas": 1,
+    "readyReplicas": 1,
+    "availableReplicas": 1,
+    "conditions": [{"type": "Available", "status": "True"}]
+  }
+}
+EOF
+`
+		if err := os.WriteFile(filepath.Join(tmpDir, "kubectl"), []byte(kubectlScript), 0755); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("PATH", tmpDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+		status := CheckWorkloadStatus(map[string]string{
+			"alertname":          "DeploymentReplicasUnavailable",
+			"exported_namespace": "apps",
+			"deployment":         "vietcalendar",
+		})
+		if status.InProgress {
+			t.Fatalf("expected InProgress=false when healthy, got: %+v", status)
+		}
+		if !status.Recovered {
+			t.Fatalf("expected Recovered=true when all desired replicas ready/available, got: %+v", status)
+		}
+	})
+}
+
+func TestFetchDiagnosticBundle_IncludesServiceEndpointsAndHelmChart(t *testing.T) {
+	binDir := t.TempDir()
+	wsDir := t.TempDir()
+
+	// Create fake git workspace with Helm chart
+	chartDir := filepath.Join(wsDir, "charts", "vinhthang-fleet")
+	tmplDir := filepath.Join(chartDir, "templates", "apps")
+	if err := os.MkdirAll(tmplDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	valuesYAML := "vietcalendar:\n  enabled: true\n  port: 8087\n  resources:\n    limits:\n      memory: 256Mi\notherSvc:\n  enabled: true\n"
+	if err := os.WriteFile(filepath.Join(chartDir, "values.yaml"), []byte(valuesYAML), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmplDir, "vietcalendar.yaml"), []byte("kind: Deployment\nmetadata:\n  name: vietcalendar\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Initialize git repo for git log check
+	for _, args := range [][]string{
+		{"init"},
+		{"config", "user.email", "test@vinhthang.dev"},
+		{"config", "user.name", "Test"},
+		{"add", "."},
+		{"commit", "-m", "feat(vietcalendar): initial helm manifest"},
+	} {
+		cmd := exec.Command("git", append([]string{"-C", wsDir}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %v (%s)", args, err, string(out))
+		}
+	}
+
+	kubectlScript := `#!/bin/sh
+case "$*" in
+  *"get svc,endpoints"*)
+    echo "NAME                   TYPE        CLUSTER-IP    PORT(S)"
+    echo "service/vietcalendar   NodePort    10.43.0.10    8087:30006/TCP"
+    echo "endpoints/vietcalendar 10.42.1.5:8087"
+    ;;
+  *"get deploy,sts,rs,pods"*)
+    echo "NAME                           READY"
+    echo "deployment.apps/vietcalendar   0/1"
+    ;;
+  *"describe pod"*)
+    echo "Name: vietcalendar-0"
+    echo "State: Waiting (ImagePullBackOff)"
+    ;;
+  *"describe deployment"*)
+    echo "Replicas: 1 desired | 0 available"
+    ;;
+  *"get events"*)
+    echo "Warning FailedToPullImage"
+    ;;
+  *"-o json"*)
+    echo '{"spec":{"template":{"spec":{"containers":[{"name":"vietcalendar","image":"ghcr.io/vinhthang/vietcalendar:0.1.0","resources":{"limits":{"memory":"256Mi"}}}]}}}}'
+    ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(binDir, "kubectl"), []byte(kubectlScript), 0755); err != nil {
+		t.Fatal(err)
+	}
+	helmScript := `#!/bin/sh
+if [ "$1" = "lint" ]; then
+  echo "1 chart(s) linted, 0 chart(s) failed"
+fi
+`
+	if err := os.WriteFile(filepath.Join(binDir, "helm"), []byte(helmScript), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	labels := map[string]string{
+		"alertname":          "DeploymentReplicasUnavailable",
+		"exported_namespace": "apps",
+		"deployment":         "vietcalendar",
+	}
+
+	bundle := FetchDiagnosticBundle(labels, wsDir)
+
+	for _, want := range []string{
+		"=== Services & Endpoints ===",
+		"service/vietcalendar",
+		"=== Namespace Workloads ===",
+		"=== Helm Chart & Values Check ===",
+		"vietcalendar.yaml",
+		"port: 8087",
+		"1 chart(s) linted, 0 chart(s) failed",
+		"initial helm manifest",
+	} {
+		if !strings.Contains(bundle, want) {
+			t.Errorf("expected diagnostic bundle to contain %q, got:\n%s", want, bundle)
+		}
 	}
 }
 

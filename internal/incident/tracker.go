@@ -4,7 +4,9 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"fmt"
 	"strings"
+	"time"
 
 	"vinhthang.dev/ai-incident-commander/internal/db"
 )
@@ -155,4 +157,51 @@ func ResolveClusterIncident(fingerprint string) (closedIssue int, err error) {
 	}
 
 	return issueNumber, nil
+}
+
+// SummarizeRecentIncidents returns a concise summary of recent cluster and application
+// incidents within window for inclusion in the daily fleet check report.
+func SummarizeRecentIncidents(window time.Duration) string {
+	if db.DB == nil {
+		return "Database disabled (no persisted 24h incident history)."
+	}
+
+	secs := int(window.Seconds())
+	var b strings.Builder
+
+	rows, err := db.DB.Query(`
+		SELECT alert_name, namespace, target_resource, state, issue_number, occurrence_count
+		FROM cluster_incidents
+		WHERE updated_at >= NOW() - make_interval(secs => $1)
+		ORDER BY updated_at DESC
+		LIMIT 20
+	`, secs)
+	if err != nil {
+		return fmt.Sprintf("Failed querying recent cluster incidents: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	clusterCount := 0
+	b.WriteString("Cluster incidents (last 24h):\n")
+	for rows.Next() {
+		var alertName, ns, target, st string
+		var issueNum, count int
+		if scanErr := rows.Scan(&alertName, &ns, &target, &st, &issueNum, &count); scanErr == nil {
+			clusterCount++
+			fmt.Fprintf(&b, "- %s (%s/%s): state=%s issue=#%d occurrences=%d\n", alertName, ns, target, st, issueNum, count)
+		}
+	}
+	if clusterCount == 0 {
+		b.WriteString("- none\n")
+	}
+
+	var openApp int
+	if appErr := db.DB.QueryRow(`
+		SELECT COUNT(*) FROM application_incidents
+		WHERE state = 'open' AND updated_at >= NOW() - make_interval(secs => $1)
+	`, secs).Scan(&openApp); appErr == nil {
+		fmt.Fprintf(&b, "Open application incidents (last 24h): %d\n", openApp)
+	}
+
+	return b.String()
 }

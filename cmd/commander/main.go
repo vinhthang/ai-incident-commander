@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -32,8 +33,10 @@ func initTracer() *sdktrace.TracerProvider {
 	var exp sdktrace.SpanExporter
 	var err error
 
-	if os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT") != "" {
-		exp, err = otlptracegrpc.New(ctx, otlptracegrpc.WithInsecure())
+	if rawEndpoint := strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")); rawEndpoint != "" {
+		ep := strings.TrimPrefix(strings.TrimPrefix(rawEndpoint, "http://"), "https://")
+		ep = strings.TrimRight(ep, "/")
+		exp, err = otlptracegrpc.New(ctx, otlptracegrpc.WithEndpoint(ep), otlptracegrpc.WithInsecure())
 	} else {
 		exp, err = stdouttrace.New(stdouttrace.WithPrettyPrint())
 	}
@@ -78,6 +81,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/webhook", webhook.HandleWebhook)
+	mux.HandleFunc("/daily-report", webhook.HandleDailyReport)
 	mux.HandleFunc("/healthz", webhook.HandleHealthz)
 
 	port := os.Getenv("PORT")
@@ -99,7 +103,7 @@ func main() {
 	defer stop()
 
 	go func() {
-		log.Printf("🚀 Modular AI Incident Commander starting on :%s (model: %s)", port, config.AgyModel)
+		log.Printf("🚀 Modular AI Incident Commander starting on :%s (model: %s, soak: %s, auto_merge: %t)", port, config.AgyModel, config.SoakDuration, config.AutoMerge)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("HTTP server error: %v", err)
 		}

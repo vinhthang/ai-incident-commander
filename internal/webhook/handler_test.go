@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -232,4 +233,59 @@ func TestHandleHealthz(t *testing.T) {
 	if body.QueueDepth < 0 {
 		t.Errorf("expected non-negative queue_depth, got %d", body.QueueDepth)
 	}
+}
+
+func TestHandleDailyReport_AuthAndMethod(t *testing.T) {
+	origToken := config.WebhookAuthToken
+	origRunner := dailyReportRunner
+	defer func() {
+		config.WebhookAuthToken = origToken
+		dailyReportRunner = origRunner
+		dailyReportRunning.Store(false)
+	}()
+
+	// Method check: GET rejected with 405
+	reqGet := httptest.NewRequest(http.MethodGet, "/daily-report", nil)
+	rrGet := httptest.NewRecorder()
+	HandleDailyReport(rrGet, reqGet)
+	if rrGet.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 on GET /daily-report, got %d", rrGet.Code)
+	}
+
+	// Auth check: unauthenticated POST rejected with 401 when token set
+	config.WebhookAuthToken = "daily-secret"
+	reqUnauth := httptest.NewRequest(http.MethodPost, "/daily-report", nil)
+	rrUnauth := httptest.NewRecorder()
+	HandleDailyReport(rrUnauth, reqUnauth)
+	if rrUnauth.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 on unauth POST /daily-report, got %d", rrUnauth.Code)
+	}
+
+	// Valid POST returns 202 Accepted and guards against concurrent duplicate
+	started := make(chan struct{})
+	release := make(chan struct{})
+	dailyReportRunner = func(ctx context.Context) {
+		close(started)
+		<-release
+	}
+
+	reqOK := httptest.NewRequest(http.MethodPost, "/daily-report", nil)
+	reqOK.Header.Set("Authorization", "Bearer daily-secret")
+	rrOK := httptest.NewRecorder()
+	HandleDailyReport(rrOK, reqOK)
+	if rrOK.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 Accepted on POST /daily-report, got %d: %s", rrOK.Code, rrOK.Body.String())
+	}
+
+	<-started
+
+	reqDup := httptest.NewRequest(http.MethodPost, "/daily-report", nil)
+	reqDup.Header.Set("Authorization", "Bearer daily-secret")
+	rrDup := httptest.NewRecorder()
+	HandleDailyReport(rrDup, reqDup)
+	if rrDup.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict while daily report is in progress, got %d", rrDup.Code)
+	}
+
+	close(release)
 }

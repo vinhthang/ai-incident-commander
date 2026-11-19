@@ -90,4 +90,39 @@ func TestRenderPrompts_AccurateClusterTopology(t *testing.T) {
 	if !strings.Contains(fixerRendered, "30001-30016") {
 		t.Errorf("fixer prompt must document NodePort range 30001-30016, got:\n%s", fixerRendered)
 	}
+	for _, want := range []string{
+		"Service & Workload Check",
+		"Helm Chart & Drift Check",
+		"VERDICT: IGNORE",
+		"VERDICT: ESCALATE_HUMAN",
+		"VERDICT: FIX_VIA_PR",
+	} {
+		if !strings.Contains(triageRendered, want) {
+			t.Errorf("triage prompt must require %q, got:\n%s", want, triageRendered)
+		}
+	}
+}
+
+func TestRenderDailyReportPrompt_ReadOnlyConstraints(t *testing.T) {
+	rendered, err := RenderDailyReportPrompt(DailyReportData{
+		Date:            "2026-11-20",
+		Snapshot:        "=== Nodes ===\narm10 Ready=True",
+		IncidentSummary: "0 firing incidents in last 24h",
+	})
+	if err != nil {
+		t.Fatalf("failed to render daily report prompt: %v", err)
+	}
+
+	for _, want := range []string{
+		"2026-11-20",
+		"STRICTLY READ-ONLY",
+		"arm10 Ready=True",
+		"0 firing incidents",
+		"HEALTH_STATUS: HEALTHY",
+		"HEALTH_STATUS: ATTENTION_NEEDED",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("daily report prompt missing %q, got:\n%s", want, rendered)
+		}
+	}
 }

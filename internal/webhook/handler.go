@@ -227,7 +227,7 @@ func processAlert(ctx context.Context, status, alertName string, labels, annotat
 		diagnosis := minion.RunTriage(ctx, alertName, labels, annotations, telemetry)
 
 		state := "open"
-		if diagnosis == "IGNORED" {
+		if diagnosis == "IGNORED" || minion.IsIgnored(diagnosis) {
 			log.Printf("Triage Minion ignored app alert %s. Saving state as ignored.", alertName)
 			span.AddEvent("Alert IGNORED by Triage Minion.")
 			state = "ignored"
@@ -243,8 +243,30 @@ func processAlert(ctx context.Context, status, alertName string, labels, annotat
 		return // Halt for apps, no GitHub PRs for now
 	}
 
-	span.AddEvent("Fetching Telemetry")
-	telemetry := k8s.FetchTelemetry(labels)
+	if config.SoakDuration > 0 {
+		span.AddEvent("Waiting Stabilization Soak")
+		log.Printf("Alert %s (%s/%s) entering %s stabilization soak...", alertName, namespace, target, config.SoakDuration)
+		if resolvedEarly := state.WaitForSoak(ctx, fingerprint, config.SoakDuration); resolvedEarly {
+			log.Printf("Alert %s (%s/%s) resolved or cancelled during soak. Halting cleanly.", alertName, namespace, target)
+			span.AddEvent("Resolved early during stabilization soak")
+			state.StateMu.Lock()
+			delete(state.ActiveIncidents, fingerprint)
+			state.StateMu.Unlock()
+			return
+		}
+	}
+
+	if ws := k8s.CheckWorkloadStatus(labels); ws.InProgress || ws.Recovered {
+		log.Printf("Deferring/suppressing alert %s (%s/%s): %s", alertName, namespace, target, ws.Summary)
+		span.AddEvent(fmt.Sprintf("Pre-triage workload check skipped action: %s", ws.Summary))
+		state.StateMu.Lock()
+		delete(state.ActiveIncidents, fingerprint)
+		state.StateMu.Unlock()
+		return
+	}
+
+	span.AddEvent("Fetching Diagnostic Bundle (Service & Helm)")
+	telemetry := k8s.FetchDiagnosticBundle(labels, config.WorkspaceDir)
 
 	if incident.IsEphemeralNodeOutage(labels, telemetry) {
 		log.Printf("Alert %s on ephemeral node %s suppressed...", alertName, labels["node"])
@@ -262,22 +284,34 @@ func processAlert(ctx context.Context, status, alertName string, labels, annotat
 		return
 	}
 
-	log.Printf("New alert %s. Running Triage Minion...", alertName)
-	span.AddEvent("Running Triage Minion")
-	diagnosis := minion.RunTriage(ctx, alertName, labels, annotations, telemetry)
+	log.Printf("New alert %s. Running Diagnostic Triage Minion...", alertName)
+	span.AddEvent("Running Diagnostic Triage Minion")
+	triageRes := minion.RunDiagnosticTriage(ctx, alertName, labels, annotations, telemetry)
 
-	if diagnosis == "IGNORED" {
-		log.Printf("Triage Minion ignored alert %s. Halting.", alertName)
-		span.AddEvent("Alert IGNORED by Triage Minion. Halting.")
+	if triageRes.Err != nil {
+		log.Printf("Diagnostic Triage failed for %s (%s/%s): %v. Halting safely without action.", alertName, namespace, target, triageRes.Err)
+		span.RecordError(triageRes.Err)
+		return
+	}
+
+	if triageRes.Action == minion.ActionIgnore {
+		log.Printf("Diagnostic Triage ignored alert %s (confidence=%s). Halting.", alertName, triageRes.Confidence)
+		span.AddEvent("Alert IGNORED by Diagnostic Triage Minion.")
 		_ = incident.RecordClusterIssue(fingerprint, alertName, namespace, target, 0, "ignored")
 		return
 	}
 
+	issueLabels := []string{"ai-incident"}
+	if triageRes.Action == minion.ActionEscalateHuman {
+		issueLabels = append(issueLabels, "needs-human-review")
+	}
+
 	span.AddEvent("Creating GitHub Issue")
 	issueTitle := fmt.Sprintf("[Alert] %s: %s/%s", alertName, namespace, target)
-	issueBody := fmt.Sprintf("## Grafana Alert: %s\n\n**Diagnosis from Triage Minion:**\n%s\n\n**Telemetry:**\n```text\n%s\n```", alertName, diagnosis, telemetry)
+	issueBody := fmt.Sprintf("## Grafana Alert: %s\n\n**Verdict**: `%s` (Confidence: `%s`)\n\n%s\n\n<details>\n<summary>Collected Diagnostic Telemetry (Service + Helm)</summary>\n\n```text\n%s\n```\n</details>",
+		alertName, triageRes.Action, triageRes.Confidence, triageRes.Summary, telemetry)
 
-	issue, err := github.CreateIssue(issueTitle, issueBody, []string{"ai-incident"})
+	issue, err := github.CreateIssue(issueTitle, issueBody, issueLabels)
 	if err != nil {
 		log.Printf("Error creating issue: %v", err)
 		span.RecordError(err)
@@ -286,6 +320,13 @@ func processAlert(ctx context.Context, status, alertName string, labels, annotat
 	span.SetAttributes(attribute.Int("github.issue", issue.GetNumber()))
 
 	_ = incident.RecordClusterIssue(fingerprint, alertName, namespace, target, issue.GetNumber(), "firing")
+
+	if triageRes.Action == minion.ActionEscalateHuman {
+		log.Printf("Diagnostic Triage concluded ESCALATE_HUMAN (confidence=%s) for issue #%d. Skipping Fixer/PR.", triageRes.Confidence, issue.GetNumber())
+		_ = github.AssignIssueOrPR(issue.GetNumber(), config.GithubOwner)
+		return
+	}
+
 	state.StateMu.Lock()
 	state.ActiveIncidents[fingerprint] = &state.IncidentState{
 		IssueNumber:  issue.GetNumber(),
@@ -295,7 +336,7 @@ func processAlert(ctx context.Context, status, alertName string, labels, annotat
 	}
 	state.StateMu.Unlock()
 
-	remediateClusterIssue(ctx, span, issue.GetNumber(), alertName, diagnosis, telemetry)
+	remediateClusterIssue(ctx, span, issue.GetNumber(), alertName, triageRes.Summary, telemetry)
 }
 
 func remediateClusterIssue(ctx context.Context, span trace.Span, issueNumber int, alertName, diagnosis, telemetry string) {
@@ -390,6 +431,13 @@ func remediateClusterIssue(ctx context.Context, span trace.Span, issueNumber int
 				reviewFeedback = ciSummary
 				_ = github.AddIssueComment(prNumber, fmt.Sprintf("⚠️ **Reviewer Approved**, but CI checks failed:\n\n```text\n%s\n```\nRetrying Fixer...", ciSummary))
 				continue
+			}
+
+			if !config.AutoMerge {
+				log.Printf("PR #%d Approved & CI Passed (%s); assigning human for merge (AUTO_MERGE=false).", prNumber, ciSummary)
+				_ = github.AddIssueComment(prNumber, fmt.Sprintf("✅ **Diagnostic, Reviewer & CI Passed** (%s): Ready for human merge (`AUTO_MERGE=false`).", ciSummary))
+				_ = github.AssignIssueOrPR(prNumber, config.GithubOwner)
+				return
 			}
 
 			log.Printf("PR #%d Approved & CI Passed (%s)! Merging...", prNumber, ciSummary)

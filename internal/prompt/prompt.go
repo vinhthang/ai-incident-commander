@@ -91,3 +91,15 @@ type SeniorFixerData struct {
 func RenderSeniorFixerPrompt(data SeniorFixerData) (string, error) {
 	return renderTemplate("senior_fixer.tmpl", data)
 }
+
+// DailyReportData holds inputs for the scheduled daily fleet audit prompt.
+type DailyReportData struct {
+	Date            string
+	Snapshot        string
+	IncidentSummary string
+}
+
+// RenderDailyReportPrompt renders the read-only daily fleet check prompt.
+func RenderDailyReportPrompt(data DailyReportData) (string, error) {
+	return renderTemplate("daily_report.tmpl", data)
+}

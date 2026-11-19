@@ -1,6 +1,7 @@
 package state
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -95,5 +96,67 @@ func TestAcquireResolveLock_RestartSafeAndDebounced(t *testing.T) {
 
 	if !AcquireResolveLock("RestartedPodAlert") {
 		t.Fatalf("expected AcquireResolveLock to succeed after debounce window expired")
+	}
+}
+
+func TestWaitForSoak_CancelsEarlyOnResolve(t *testing.T) {
+	resetState()
+	ClearResolveDebounceForTest()
+
+	fp := "soak-early-cancel"
+	if !AcquireIncidentLock(fp, "firing") {
+		t.Fatalf("expected firing lock to be acquired")
+	}
+
+	done := make(chan bool, 1)
+	start := time.Now()
+	go func() {
+		done <- WaitForSoak(context.Background(), fp, 5*time.Second)
+	}()
+
+	time.Sleep(25 * time.Millisecond)
+	if !AcquireResolveLock(fp) {
+		t.Fatalf("expected resolve lock to be acquired during soak")
+	}
+
+	resolvedEarly := <-done
+	elapsed := time.Since(start)
+
+	if !resolvedEarly {
+		t.Fatalf("expected WaitForSoak to return resolvedEarly=true when resolved arrived")
+	}
+	if elapsed >= 500*time.Millisecond {
+		t.Fatalf("expected WaitForSoak to cancel immediately (<500ms), took %v", elapsed)
+	}
+}
+
+func TestWaitForSoak_CompletesFullWindowWhenNotResolved(t *testing.T) {
+	resetState()
+	ClearResolveDebounceForTest()
+
+	fp := "soak-full-window"
+	if !AcquireIncidentLock(fp, "firing") {
+		t.Fatalf("expected firing lock to be acquired")
+	}
+
+	done := make(chan bool, 1)
+	start := time.Now()
+	go func() {
+		done <- WaitForSoak(context.Background(), fp, 45*time.Millisecond)
+	}()
+
+	time.Sleep(15 * time.Millisecond)
+	if AcquireIncidentLock(fp, "firing") {
+		t.Fatalf("expected duplicate firing webhook to be dropped while Status == SOAKING")
+	}
+
+	resolvedEarly := <-done
+	elapsed := time.Since(start)
+
+	if resolvedEarly {
+		t.Fatalf("expected WaitForSoak to return false when not resolved")
+	}
+	if elapsed < 35*time.Millisecond {
+		t.Fatalf("expected WaitForSoak to sleep >= 35ms, elapsed %v", elapsed)
 	}
 }
