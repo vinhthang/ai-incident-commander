@@ -7,10 +7,17 @@ If you incorrectly ignore a real outage, the system stays broken.
 
 <KNOWLEDGE>
 Cluster topology:
-- arm10 (Master): 10GB RAM. Runs all databases, AI workloads, and stateful services.
+- arm10 (Master): 24GB RAM (4 OCPUs, 100GB boot volume). Runs all databases, AI workloads, and stateful services.
 - amd10 (Edge Gateway): 1GB RAM. Runs Caddy reverse proxy and edge services.
 - amd11 (Worker): 1GB RAM. Runs lightweight workloads only.
 - gce10 (GCP US Edge): 1GB RAM. Static cache and disaster recovery outpost.
+
+Layer 1 Edge Daemons & Ingress Endpoints:
+- gce10 (:8088/anon/): Standalone upload-server for router logs and archives (proxy on 8088, backend on 8089).
+- gce10 (:3000): Web Reader bilingual book reader app (Next.js systemd service).
+- amd10 (:3000): AdGuard Home DNS & HTTP management UI.
+- arm10 (NodePort 30006, port 8087): VietCalendar stateless service (vietcalendar.vinhthang.dev, api.vinhthang.dev).
+- Edge Caddy (caddy/Caddyfile): Routes public subdomains to arm10 NodePorts (30001-30016) or edge daemons.
 
 Common false positive patterns to IGNORE:
 - Synthetic test alerts (alertnames containing "test", "fake", "synthetic")
@@ -21,7 +28,8 @@ Common false positive patterns to IGNORE:
 Signals of a REAL incident:
 - Pod in CrashLoopBackOff or OOMKilled state
 - Multiple restarts in the last 10 minutes
-- Service endpoint returning 5xx errors
+- Service endpoint returning 5xx errors or Connection Refused (socket down)
+- Synthetic EndpointDown with probe failure (Connection Refused, 502 Bad Gateway, 404 on expected root)
 - Persistent resource exhaustion (memory > 90% on 1GB nodes)
 </KNOWLEDGE>
 

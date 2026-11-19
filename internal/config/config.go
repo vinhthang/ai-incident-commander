@@ -13,7 +13,7 @@ var (
 	GithubOwner  = GetEnv("GITHUB_OWNER", "vinhthang")
 	GithubRepo   = GetEnv("GITHUB_REPO", "oci")
 
-	WorkspaceDir = "/app/workspace/oci"
+	WorkspaceDir = GetEnv("WORKSPACE_DIR", "/app/workspace/oci")
 	CooldownMins = 5 * time.Minute
 )
 

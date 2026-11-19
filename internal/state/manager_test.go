@@ -54,3 +54,17 @@ func TestResolveNonExistentIncident(t *testing.T) {
 		t.Errorf("Should not acquire lock or track resolved incidents that have no active state")
 	}
 }
+
+func TestConcurrentDistinctFingerprintsDoNotCollide(t *testing.T) {
+	resetState()
+
+	if !AcquireIncidentLock("fp-endpoint-a", "firing") {
+		t.Errorf("Expected to acquire lock for fp-endpoint-a")
+	}
+	if !AcquireIncidentLock("fp-endpoint-b", "firing") {
+		t.Errorf("Expected to acquire lock for concurrent distinct fingerprint fp-endpoint-b")
+	}
+	if AcquireIncidentLock("fp-endpoint-a", "firing") {
+		t.Errorf("Expected duplicate lock acquisition for fp-endpoint-a to fail while active")
+	}
+}

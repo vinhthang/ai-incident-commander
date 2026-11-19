@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"vinhthang.dev/ai-incident-commander/internal/config"
@@ -18,11 +19,12 @@ func InitWorkspace() {
 		_ = exec.Command("git", "config", "--global", key, "https://github.com/").Run()
 	}
 
-	_ = os.MkdirAll("/app/workspace", 0755)
+	parentDir := filepath.Dir(config.WorkspaceDir)
+	_ = os.MkdirAll(parentDir, 0755)
 	if _, err := os.Stat(config.WorkspaceDir); os.IsNotExist(err) {
 		log.Printf("Cloning workspace...")
 		cmd := exec.Command("git", "clone", fmt.Sprintf("https://github.com/%s/%s.git", config.GithubOwner, config.GithubRepo), config.WorkspaceDir)
-		cmd.Dir = "/app/workspace"
+		cmd.Dir = parentDir
 		_ = cmd.Run()
 	} else {
 		log.Printf("Workspace exists. Pulling latest.")

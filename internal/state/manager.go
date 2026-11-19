@@ -20,16 +20,16 @@ var (
 	StateMu         sync.RWMutex
 )
 
-func AcquireIncidentLock(alertName, status string) bool {
+func AcquireIncidentLock(incidentKey, status string) bool {
 	StateMu.Lock()
 	defer StateMu.Unlock()
 
-	state, exists := ActiveIncidents[alertName]
+	state, exists := ActiveIncidents[incidentKey]
 	if !exists {
 		if status == "resolved" {
 			return false
 		}
-		ActiveIncidents[alertName] = &IncidentState{
+		ActiveIncidents[incidentKey] = &IncidentState{
 			AttemptCount: 0,
 			LastAttempt:  time.Now(),
 			Status:       "TRIAGING",
@@ -43,12 +43,12 @@ func AcquireIncidentLock(alertName, status string) bool {
 	}
 
 	if state.Status == "TRIAGING" || state.Status == "FIXING" {
-		log.Printf("Alert %s is currently %s. Dropping concurrent webhook.", alertName, state.Status)
+		log.Printf("Incident %s is currently %s. Dropping concurrent webhook.", incidentKey, state.Status)
 		return false
 	}
 
 	if time.Since(state.LastAttempt) < config.CooldownMins {
-		log.Printf("Alert %s is within cooldown. Dropping webhook.", alertName)
+		log.Printf("Incident %s is within cooldown. Dropping webhook.", incidentKey)
 		return false
 	}
 
@@ -57,10 +57,10 @@ func AcquireIncidentLock(alertName, status string) bool {
 	return true
 }
 
-func ReleaseIncidentLock(alertName string, newStatus string) {
+func ReleaseIncidentLock(incidentKey string, newStatus string) {
 	StateMu.Lock()
 	defer StateMu.Unlock()
-	if state, exists := ActiveIncidents[alertName]; exists {
+	if state, exists := ActiveIncidents[incidentKey]; exists {
 		state.Status = newStatus
 	}
 }

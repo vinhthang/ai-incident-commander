@@ -16,16 +16,34 @@ func ComputeFingerprint(alertName, namespace, targetResource string) string {
 	return hex.EncodeToString(h[:])
 }
 
+// ExtractNamespace determines the Kubernetes namespace from alert labels,
+// prioritizing Prometheus relabeled exported_namespace over namespace.
+func ExtractNamespace(labels map[string]string) string {
+	if ns := labels["exported_namespace"]; ns != "" {
+		return ns
+	}
+	return labels["namespace"]
+}
+
 // ExtractTargetResource determines the primary target resource from alert labels.
-// Priority order: pod > statefulset > deployment > service > app > instance > "cluster".
+// Priority order: exported_pod > pod > statefulset > deployment > service > app > http_url > endpoint > url > host > node > instance > "cluster".
 func ExtractTargetResource(labels map[string]string) string {
-	keys := []string{"pod", "statefulset", "deployment", "service", "app", "instance"}
+	keys := []string{"exported_pod", "pod", "statefulset", "deployment", "service", "app", "http_url", "endpoint", "url", "host", "node", "instance"}
 	for _, k := range keys {
 		if val, ok := labels[k]; ok && val != "" {
+			if k == "http_url" || k == "url" {
+				return cleanURLTarget(val)
+			}
 			return val
 		}
 	}
 	return "cluster"
+}
+
+func cleanURLTarget(rawURL string) string {
+	cleaned := strings.TrimPrefix(rawURL, "http://")
+	cleaned = strings.TrimPrefix(cleaned, "https://")
+	return cleaned
 }
 
 // IsEphemeralNodeOutage checks whether an alert is due to a known transient worker reboot / CNI startup issue.

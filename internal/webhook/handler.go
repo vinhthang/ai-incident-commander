@@ -52,7 +52,8 @@ func HandleWebhook(w http.ResponseWriter, r *http.Request) {
 		}
 
 		go func(detachedCtx context.Context, aStatus, aName string, aLabels, aAnnotations map[string]string) {
-			if !state.AcquireIncidentLock(aName, aStatus) {
+			_, _, fingerprint := computeAlertIdentity(aName, aLabels)
+			if !state.AcquireIncidentLock(fingerprint, aStatus) {
 				return // Dropped or debounced
 			}
 			// Enforce 10-minute overall lifecycle timeout to prevent leaked goroutines
@@ -67,18 +68,24 @@ func HandleWebhook(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte("Webhook received"))
 }
 
+func computeAlertIdentity(alertName string, labels map[string]string) (namespace, target, fingerprint string) {
+	namespace = incident.ExtractNamespace(labels)
+	target = incident.ExtractTargetResource(labels)
+	fingerprint = incident.ComputeFingerprint(alertName, namespace, target)
+	return namespace, target, fingerprint
+}
+
 func processAlert(ctx context.Context, status, alertName string, labels, annotations map[string]string) {
+	namespace, target, fingerprint := computeAlertIdentity(alertName, labels)
+
 	ctx, span := tracer.Start(ctx, "processAlert")
 	defer span.End()
-	defer state.ReleaseIncidentLock(alertName, "COOLING_DOWN")
+	defer state.ReleaseIncidentLock(fingerprint, "COOLING_DOWN")
 
 	span.SetAttributes(
 		attribute.String("alert.name", alertName),
 		attribute.String("alert.status", status),
 	)
-
-	target := incident.ExtractTargetResource(labels)
-	fingerprint := incident.ComputeFingerprint(alertName, labels["namespace"], target)
 
 	if status == "resolved" {
 		log.Printf("Alert %s resolved. Cleaning active incident state.", alertName)
@@ -89,17 +96,17 @@ func processAlert(ctx context.Context, status, alertName string, labels, annotat
 			log.Printf("Error resolving cluster incident %s: %v", fingerprint, err)
 		}
 		if closedIssue > 0 {
-			comment := fmt.Sprintf("✅ Alert %s (%s/%s) resolved: Cluster telemetry confirmed healthy.", alertName, labels["namespace"], target)
+			comment := fmt.Sprintf("✅ Alert %s (%s/%s) resolved: Cluster telemetry confirmed healthy.", alertName, namespace, target)
 			if err := github.CloseIssue(closedIssue, comment); err != nil {
 				log.Printf("Failed to close issue #%d: %v", closedIssue, err)
 			}
 		} else {
-			titlePrefix := fmt.Sprintf("[Alert] %s: %s/%s", alertName, labels["namespace"], target)
+			titlePrefix := fmt.Sprintf("[Alert] %s: %s/%s", alertName, namespace, target)
 			issue, err := github.FindOpenIssueByTitle(titlePrefix)
 			if err != nil {
 				log.Printf("Failed searching open issue by title prefix %s: %v", titlePrefix, err)
 			} else if issue != nil {
-				comment := fmt.Sprintf("✅ Alert %s (%s/%s) resolved: Cluster telemetry confirmed healthy.", alertName, labels["namespace"], target)
+				comment := fmt.Sprintf("✅ Alert %s (%s/%s) resolved: Cluster telemetry confirmed healthy.", alertName, namespace, target)
 				if err := github.CloseIssue(issue.GetNumber(), comment); err != nil {
 					log.Printf("Failed to close found issue #%d: %v", issue.GetNumber(), err)
 				}
@@ -107,13 +114,12 @@ func processAlert(ctx context.Context, status, alertName string, labels, annotat
 		}
 
 		state.StateMu.Lock()
-		delete(state.ActiveIncidents, alertName)
 		delete(state.ActiveIncidents, fingerprint)
 		state.StateMu.Unlock()
 		return
 	}
 
-	if labels["namespace"] == "apps" {
+	if namespace == "apps" {
 		serviceName := labels["service"]
 		if serviceName == "" {
 			serviceName = labels["app"]
@@ -176,7 +182,7 @@ func processAlert(ctx context.Context, status, alertName string, labels, annotat
 		return
 	}
 
-	isDuplicate, existingIssue, err := incident.TrackClusterIncident(fingerprint, alertName, labels["namespace"], target)
+	isDuplicate, existingIssue, err := incident.TrackClusterIncident(fingerprint, alertName, namespace, target)
 	if err != nil {
 		log.Printf("Error tracking cluster incident %s: %v", fingerprint, err)
 	}
@@ -193,12 +199,12 @@ func processAlert(ctx context.Context, status, alertName string, labels, annotat
 	if diagnosis == "IGNORED" {
 		log.Printf("Triage Minion ignored alert %s. Halting.", alertName)
 		span.AddEvent("Alert IGNORED by Triage Minion. Halting.")
-		_ = incident.RecordClusterIssue(fingerprint, alertName, labels["namespace"], target, 0, "ignored")
+		_ = incident.RecordClusterIssue(fingerprint, alertName, namespace, target, 0, "ignored")
 		return
 	}
 
 	span.AddEvent("Creating GitHub Issue")
-	issueTitle := fmt.Sprintf("[Alert] %s: %s/%s", alertName, labels["namespace"], target)
+	issueTitle := fmt.Sprintf("[Alert] %s: %s/%s", alertName, namespace, target)
 	issueBody := fmt.Sprintf("## Grafana Alert: %s\n\n**Diagnosis from Triage Minion:**\n%s\n\n**Telemetry:**\n```text\n%s\n```", alertName, diagnosis, telemetry)
 
 	issue, err := github.CreateIssue(issueTitle, issueBody, []string{"ai-incident"})
@@ -209,7 +215,7 @@ func processAlert(ctx context.Context, status, alertName string, labels, annotat
 	}
 	span.SetAttributes(attribute.Int("github.issue", issue.GetNumber()))
 
-	_ = incident.RecordClusterIssue(fingerprint, alertName, labels["namespace"], target, issue.GetNumber(), "firing")
+	_ = incident.RecordClusterIssue(fingerprint, alertName, namespace, target, issue.GetNumber(), "firing")
 	state.StateMu.Lock()
 	state.ActiveIncidents[fingerprint] = &state.IncidentState{
 		IssueNumber:  issue.GetNumber(),

@@ -9,7 +9,7 @@ If a file already violates a rule (e.g. it already uses `:latest`), and the PR t
 <KNOWLEDGE>
 Architecture invariants to enforce on NEW or MODIFIED code in the diff:
 1. Resource limits: amd10/amd11/gce10 are strictly capped at 1GB RAM. Any deployment requesting >900Mi on these nodes in the diff is a REJECT.
-2. arm10 (master) has 10GB RAM — databases and AI runtimes belong here.
+2. arm10 (master) has 24GB RAM — databases and AI runtimes belong here.
 3. All Kubernetes manifests MUST live inside 'charts/vinhthang-fleet/'. Introducing raw kubectl YAML outside the chart is a REJECT.
 4. Image Hygiene: If the diff adds or modifies a container image, it MUST use a pinned semantic version (e.g., '1.37.2-alpine'). Introducing new floating tags (':latest', ':main') in the diff is a REJECT. Pre-existing untouched floating tags elsewhere in the file should be noted in Findings as advisory notes, but MUST NOT block approving the incident fix.
 5. Port Safety: If the diff adds or modifies a listening port, port 8080 is FORBIDDEN. Introducing port 8080 in the diff is a REJECT. Pre-existing untouched 8080 ports elsewhere in the file should be noted in Findings as advisory notes, but MUST NOT block approving the incident fix.

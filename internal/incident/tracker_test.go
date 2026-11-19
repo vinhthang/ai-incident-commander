@@ -38,6 +38,14 @@ func TestExtractTargetResource(t *testing.T) {
 		expected string
 	}{
 		{
+			name: "exported_pod takes priority over pod",
+			labels: map[string]string{
+				"exported_pod": "exp-pod-1",
+				"pod":          "pod-1",
+			},
+			expected: "exp-pod-1",
+		},
+		{
 			name: "pod takes top priority",
 			labels: map[string]string{
 				"pod":         "mypod-123",
@@ -95,6 +103,39 @@ func TestExtractTargetResource(t *testing.T) {
 			expected: "10.0.0.1",
 		},
 		{
+			name: "http_url prioritized when k8s workloads absent",
+			labels: map[string]string{
+				"http_url": "http://10.10.0.4:8088/anon/",
+				"instance": "otel-collector",
+			},
+			expected: "10.10.0.4:8088/anon/",
+		},
+		{
+			name: "endpoint prioritized when instance is probe source",
+			labels: map[string]string{
+				"endpoint": "https://collab.vinhthang.dev",
+				"instance": "blackbox",
+			},
+			expected: "https://collab.vinhthang.dev",
+		},
+		{
+			name: "host prioritized over node and instance for Caddy 5xx alerts",
+			labels: map[string]string{
+				"host":     "vault.vinhthang.dev",
+				"instance": "10.0.0.235:2019",
+				"code":     "502",
+			},
+			expected: "vault.vinhthang.dev",
+		},
+		{
+			name: "node prioritized over generic instance when no k8s workload",
+			labels: map[string]string{
+				"node":     "gce10",
+				"instance": "node-exporter",
+			},
+			expected: "gce10",
+		},
+		{
 			name:     "cluster fallback when no known keys",
 			labels:   map[string]string{"foo": "bar"},
 			expected: "cluster",
@@ -111,6 +152,44 @@ func TestExtractTargetResource(t *testing.T) {
 			res := ExtractTargetResource(tc.labels)
 			if res != tc.expected {
 				t.Errorf("ExtractTargetResource() = %s, expected %s", res, tc.expected)
+			}
+		})
+	}
+}
+
+func TestExtractNamespace(t *testing.T) {
+	tests := []struct {
+		name     string
+		labels   map[string]string
+		expected string
+	}{
+		{
+			name: "exported_namespace takes priority over namespace",
+			labels: map[string]string{
+				"exported_namespace": "apps",
+				"namespace":          "observability",
+			},
+			expected: "apps",
+		},
+		{
+			name: "falls back to namespace when exported_namespace is absent",
+			labels: map[string]string{
+				"namespace": "data",
+			},
+			expected: "data",
+		},
+		{
+			name:     "returns empty string when both absent",
+			labels:   map[string]string{},
+			expected: "",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			res := ExtractNamespace(tc.labels)
+			if res != tc.expected {
+				t.Errorf("ExtractNamespace() = %s, expected %s", res, tc.expected)
 			}
 		})
 	}

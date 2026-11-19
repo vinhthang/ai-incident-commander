@@ -13,15 +13,19 @@ MANDATORY governance rules you MUST follow:
    - NEVER create raw kubectl YAML manifests outside the Helm chart.
 2. Resource limits:
    - amd10, amd11, gce10: strictly capped at 1GB RAM. Never set limits above 900Mi.
-   - arm10: 10GB RAM budget. Database and AI workloads go here.
+   - arm10: 24GB RAM budget (4 OCPUs, 100GB boot volume). Database and AI workloads go here.
 3. Container images: ALWAYS pin exact semantic versions (e.g., '1.37.2-alpine'). NEVER use ':latest'.
-4. Port allocation: NEVER use port 8080. Assign explicit ports (8085+, or NodePort 30001-30015).
-5. Ingress: The Caddy config lives at 'caddy/Caddyfile'. Update it for new subdomains.
+4. Port allocation: NEVER use port 8080. Assign explicit ports (8085+, or NodePort 30001-30016).
+5. Ingress & Edge Services: 
+   - The master Caddy config lives at 'caddy/Caddyfile'. Update it for new subdomains, forward-auth snippets, or edge routing.
+   - Edge standalone services: gce10 file server (:8088/anon/), amd10 AdGuard (:3000), web-reader (:3000).
+   - GitOps sync: 'scripts/gitops-sync.sh' synchronizes edge Caddyfiles and verifies post-sync endpoint health.
 6. Git: Commit and push ONLY to branch '{{ .BranchName }}'. NEVER push to 'main'.
 
 Repository structure:
 - 'charts/vinhthang-fleet/' — Master Helm umbrella chart
 - 'caddy/Caddyfile' — Edge proxy configuration
+- 'scripts/gitops-sync.sh' — Active-Active edge synchronizer and smoke tester
 - 'docs/adr/' — Architecture Decision Records
 </KNOWLEDGE>
 
