@@ -5,11 +5,41 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
 	"vinhthang.dev/ai-incident-commander/internal/db"
 )
+
+var (
+	cronJobPodSuffixRe    = regexp.MustCompile(`-[0-9]{7,10}-[a-z0-9]{5}$`)
+	cronJobSuffixRe       = regexp.MustCompile(`-[0-9]{7,10}$`)
+	deploymentPodSuffixRe = regexp.MustCompile(`-[a-z0-9]{8,10}-[a-z0-9]{5}$`)
+	stsOrdinalSuffixRe    = regexp.MustCompile(`^(.+?[a-zA-Z].*?)-[0-9]+$`)
+)
+
+// NormalizeWorkloadBase strips ephemeral Kubernetes pod and job suffixes to derive the
+// stable workload base name for cross-alert GitHub Issue/PR deduplication.
+func NormalizeWorkloadBase(target string) string {
+	trimmed := strings.TrimSpace(target)
+	if trimmed == "" {
+		return ""
+	}
+	if cronJobPodSuffixRe.MatchString(trimmed) {
+		return cronJobPodSuffixRe.ReplaceAllString(trimmed, "")
+	}
+	if cronJobSuffixRe.MatchString(trimmed) {
+		return cronJobSuffixRe.ReplaceAllString(trimmed, "")
+	}
+	if deploymentPodSuffixRe.MatchString(trimmed) {
+		return deploymentPodSuffixRe.ReplaceAllString(trimmed, "")
+	}
+	if matches := stsOrdinalSuffixRe.FindStringSubmatch(trimmed); len(matches) == 2 {
+		return matches[1]
+	}
+	return trimmed
+}
 
 // ComputeFingerprint returns a deterministic SHA-256 fingerprint for the incident.
 func ComputeFingerprint(alertName, namespace, targetResource string) string {

@@ -105,6 +105,116 @@ func FindOpenIssueByTitle(titlePrefix string) (*github.Issue, error) {
 	return nil, nil
 }
 
+func matchesTargetPrefix(haystack, needle string) bool {
+	needle = strings.ToLower(strings.TrimSpace(needle))
+	if needle == "" {
+		return false
+	}
+	lower := strings.ToLower(haystack)
+	searchFrom := 0
+	for {
+		idx := strings.Index(lower[searchFrom:], needle)
+		if idx < 0 {
+			return false
+		}
+		endPos := searchFrom + idx + len(needle)
+		if endPos == len(lower) {
+			return true
+		}
+		switch lower[endPos] {
+		case '-', ':', '/', ' ', ')', ',', '\n', '\r', '`':
+			return true
+		}
+		searchFrom += idx + 1
+	}
+}
+
+func targetNeedles(namespace, target, workloadBase string) []string {
+	var raw []string
+	if namespace != "" {
+		if target != "" {
+			raw = append(raw, namespace+"/"+target)
+		}
+		if workloadBase != "" && workloadBase != target {
+			raw = append(raw, namespace+"/"+workloadBase)
+		}
+	} else {
+		if target != "" {
+			raw = append(raw, target)
+		}
+		if workloadBase != "" && workloadBase != target {
+			raw = append(raw, workloadBase)
+		}
+	}
+	return raw
+}
+
+// FindOpenIssueForTarget returns an open ai-incident GitHub Issue referencing the same
+// namespace/target or normalized workload base (ignoring PRs), preventing duplicate issues across alerts.
+func FindOpenIssueForTarget(namespace, target, workloadBase string) (*github.Issue, error) {
+	if Client == nil {
+		return nil, nil
+	}
+	opts := &github.IssueListByRepoOptions{
+		State:       "open",
+		Labels:      []string{"ai-incident"},
+		ListOptions: github.ListOptions{PerPage: 50},
+	}
+	issues, _, err := Client.Issues.ListByRepo(context.Background(), config.GithubOwner, config.GithubRepo, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	needles := targetNeedles(namespace, target, workloadBase)
+	for _, issue := range issues {
+		if issue == nil || issue.IsPullRequest() {
+			continue
+		}
+		title := issue.GetTitle()
+		for _, needle := range needles {
+			if matchesTargetPrefix(title, needle) {
+				return issue, nil
+			}
+		}
+	}
+	return nil, nil
+}
+
+// FindOpenPRForTarget returns an open autonomous fix PR (head ref fix/alert-*) targeting the same
+// namespace/target or workload base so subsequent alerts do not create redundant fix PRs.
+func FindOpenPRForTarget(namespace, target, workloadBase string) (*github.PullRequest, error) {
+	if Client == nil {
+		return nil, nil
+	}
+	opts := &github.PullRequestListOptions{
+		State:       "open",
+		ListOptions: github.ListOptions{PerPage: 50},
+	}
+	prs, _, err := Client.PullRequests.List(context.Background(), config.GithubOwner, config.GithubRepo, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	needles := targetNeedles(namespace, target, workloadBase)
+	if workloadBase != "" {
+		needles = append(needles, "workload: "+workloadBase, "**workload**: "+workloadBase)
+	}
+
+	for _, pr := range prs {
+		if pr == nil || !strings.HasPrefix(pr.GetHead().GetRef(), "fix/alert-") {
+			continue
+		}
+		title := pr.GetTitle()
+		body := pr.GetBody()
+		for _, needle := range needles {
+			if matchesTargetPrefix(title, needle) || matchesTargetPrefix(body, needle) {
+				return pr, nil
+			}
+		}
+	}
+	return nil, nil
+}
+
 // EvaluateCheckRuns inspects a snapshot of GitHub check runs on a PR head commit.
 // It returns done=true once checks finish or fail, passed=true only if >=1 run exists
 // and every completed check concluded with success, neutral, or skipped.

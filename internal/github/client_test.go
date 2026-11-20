@@ -217,3 +217,116 @@ func TestWaitForPRChecks(t *testing.T) {
 		}
 	})
 }
+
+func TestFindOpenIssueForTarget(t *testing.T) {
+	origClient := Client
+	origOwner := config.GithubOwner
+	origRepo := config.GithubRepo
+	defer func() {
+		Client = origClient
+		config.GithubOwner = origOwner
+		config.GithubRepo = origRepo
+	}()
+	config.GithubOwner = "vinhthang"
+	config.GithubRepo = "oci"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/repos/vinhthang/oci/issues" {
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{
+					"number":       336,
+					"title":        "[Alert] PodCrashLoopBackOff: system/ai-commander-daily-report",
+					"pull_request": map[string]any{"url": "https://api.github.com/repos/vinhthang/oci/pulls/336"},
+				},
+				{
+					"number": 335,
+					"title":  "[Alert] PodCrashLoopBackOff: system/ai-commander-daily-report-29918895-t9lz7",
+				},
+				{
+					"number": 340,
+					"title":  "[Alert] PodOOMKilled: apps/memos",
+				},
+			})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	Client = gh.NewClient(srv.Client())
+	baseURL, _ := url.Parse(srv.URL + "/")
+	Client.BaseURL = baseURL
+
+	found, err := FindOpenIssueForTarget("system", "ai-commander-daily-report-29918895", "ai-commander-daily-report")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if found == nil || found.GetNumber() != 335 {
+		t.Fatalf("expected open issue #335 matching workload base, got %+v", found)
+	}
+
+	none, err := FindOpenIssueForTarget("apps", "vietcalendar", "vietcalendar")
+	if err != nil {
+		t.Fatalf("unexpected error for unmatched target: %v", err)
+	}
+	if none != nil {
+		t.Fatalf("expected nil for unmatched target, got issue #%d", none.GetNumber())
+	}
+}
+
+func TestFindOpenPRForTarget(t *testing.T) {
+	origClient := Client
+	origOwner := config.GithubOwner
+	origRepo := config.GithubRepo
+	defer func() {
+		Client = origClient
+		config.GithubOwner = origOwner
+		config.GithubRepo = origRepo
+	}()
+	config.GithubOwner = "vinhthang"
+	config.GithubRepo = "oci"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/repos/vinhthang/oci/pulls" {
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{
+					"number": 100,
+					"title":  "Update README for system/ai-commander-daily-report",
+					"body":   "Manual docs update",
+					"head":   map[string]any{"ref": "feat/docs"},
+				},
+				{
+					"number": 336,
+					"title":  "Fix for PodCrashLoopBackOff: system/ai-commander-daily-report-29918895-t9lz7 (Issue #335)",
+					"body":   "Automated PR.\n\n**Namespace**: system\n**Workload**: ai-commander-daily-report\n\nCloses #335",
+					"head":   map[string]any{"ref": "fix/alert-335-1795133964"},
+				},
+			})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	Client = gh.NewClient(srv.Client())
+	baseURL, _ := url.Parse(srv.URL + "/")
+	Client.BaseURL = baseURL
+
+	pr, err := FindOpenPRForTarget("system", "ai-commander-daily-report-29918895", "ai-commander-daily-report")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if pr == nil || pr.GetNumber() != 336 {
+		t.Fatalf("expected open fix PR #336 matching workload base, got %+v", pr)
+	}
+
+	none, err := FindOpenPRForTarget("apps", "vietcalendar", "vietcalendar")
+	if err != nil {
+		t.Fatalf("unexpected error for unmatched target: %v", err)
+	}
+	if none != nil {
+		t.Fatalf("expected nil for unmatched target, got PR #%d", none.GetNumber())
+	}
+}

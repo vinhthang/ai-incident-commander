@@ -284,6 +284,12 @@ func processAlert(ctx context.Context, status, alertName string, labels, annotat
 		return
 	}
 
+	workloadBase := incident.NormalizeWorkloadBase(target)
+	if checkExistingOpenGitHubWork(fingerprint, alertName, namespace, target, workloadBase) {
+		span.AddEvent("Duplicate avoided via open GitHub Issue/PR lookup before triage.")
+		return
+	}
+
 	log.Printf("New alert %s. Running Diagnostic Triage Minion...", alertName)
 	span.AddEvent("Running Diagnostic Triage Minion")
 	triageRes := minion.RunDiagnosticTriage(ctx, alertName, labels, annotations, telemetry)
@@ -298,6 +304,11 @@ func processAlert(ctx context.Context, status, alertName string, labels, annotat
 		log.Printf("Diagnostic Triage ignored alert %s (confidence=%s). Halting.", alertName, triageRes.Confidence)
 		span.AddEvent("Alert IGNORED by Diagnostic Triage Minion.")
 		_ = incident.RecordClusterIssue(fingerprint, alertName, namespace, target, 0, "ignored")
+		return
+	}
+
+	if checkExistingOpenGitHubWork(fingerprint, alertName, namespace, target, workloadBase) {
+		span.AddEvent("Duplicate avoided via open GitHub Issue/PR lookup before creating issue.")
 		return
 	}
 
@@ -336,10 +347,36 @@ func processAlert(ctx context.Context, status, alertName string, labels, annotat
 	}
 	state.StateMu.Unlock()
 
-	remediateClusterIssue(ctx, span, issue.GetNumber(), alertName, triageRes.Summary, telemetry)
+	remediateClusterIssue(ctx, span, issue.GetNumber(), alertName, namespace, target, workloadBase, triageRes.Summary, telemetry)
 }
 
-func remediateClusterIssue(ctx context.Context, span trace.Span, issueNumber int, alertName, diagnosis, telemetry string) {
+func checkExistingOpenGitHubWork(fingerprint, alertName, namespace, target, workloadBase string) bool {
+	if existingIssue, err := github.FindOpenIssueForTarget(namespace, target, workloadBase); err != nil {
+		log.Printf("Error checking open GitHub issues for %s/%s: %v", namespace, target, err)
+	} else if existingIssue != nil {
+		log.Printf("Open GitHub issue #%d already tracks %s/%s (base=%s); suppressing duplicate issue for %s.",
+			existingIssue.GetNumber(), namespace, target, workloadBase, alertName)
+		_ = github.AddIssueComment(existingIssue.GetNumber(),
+			fmt.Sprintf("🔁 Related alert `%s` (`%s/%s`) observed while this issue is open; suppressing duplicate issue/PR.", alertName, namespace, target))
+		_ = incident.RecordClusterIssue(fingerprint, alertName, namespace, target, existingIssue.GetNumber(), "firing")
+		return true
+	}
+
+	if existingPR, err := github.FindOpenPRForTarget(namespace, target, workloadBase); err != nil {
+		log.Printf("Error checking open GitHub PRs for %s/%s: %v", namespace, target, err)
+	} else if existingPR != nil {
+		log.Printf("Open GitHub fix PR #%d already addresses %s/%s (base=%s); suppressing duplicate issue/PR for %s.",
+			existingPR.GetNumber(), namespace, target, workloadBase, alertName)
+		_ = github.AddIssueComment(existingPR.GetNumber(),
+			fmt.Sprintf("🔁 Alert `%s` (`%s/%s`) fired while fix PR #%d is open awaiting merge; suppressing duplicate issue/PR.", alertName, namespace, target, existingPR.GetNumber()))
+		_ = incident.RecordClusterIssue(fingerprint, alertName, namespace, target, existingPR.GetNumber(), "firing")
+		return true
+	}
+
+	return false
+}
+
+func remediateClusterIssue(ctx context.Context, span trace.Span, issueNumber int, alertName, namespace, target, workloadBase, diagnosis, telemetry string) {
 	workspace.Lock()
 	defer workspace.Unlock()
 
@@ -394,8 +431,8 @@ func remediateClusterIssue(ctx context.Context, span trace.Span, issueNumber int
 		if !prCreated {
 			log.Printf("Creating Pull Request...")
 			span.AddEvent("Creating Pull Request")
-			prTitle := fmt.Sprintf("Fix for %s (Issue #%d)", alertName, issueNumber)
-			prBody := fmt.Sprintf("Automated PR by AI Fixer Minion.\nCloses #%d", issueNumber)
+			prTitle := fmt.Sprintf("Fix for %s: %s/%s (Issue #%d)", alertName, namespace, target, issueNumber)
+			prBody := fmt.Sprintf("Automated PR by AI Fixer Minion.\n\n**Namespace**: %s\n**Target**: %s\n**Workload**: %s\n\nCloses #%d", namespace, target, workloadBase, issueNumber)
 
 			pr, err := github.CreatePullRequest(branchName, prTitle, prBody)
 			if err != nil {

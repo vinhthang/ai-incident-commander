@@ -316,3 +316,27 @@ func TestDatabaseNilSafety(t *testing.T) {
 		t.Errorf("unexpected result with nil DB: %v, %v", closedIssue, err)
 	}
 }
+
+func TestNormalizeWorkloadBase(t *testing.T) {
+	tests := []struct {
+		target string
+		want   string
+	}{
+		{target: "ai-commander-daily-report-29918895-t9lz7", want: "ai-commander-daily-report"},
+		{target: "ai-commander-daily-report-29918895", want: "ai-commander-daily-report"},
+		{target: "vietcalendar-cfdf86c88-6zvv6", want: "vietcalendar"},
+		{target: "postgres-primary-0", want: "postgres-primary"},
+		{target: "vietcalendar", want: "vietcalendar"},
+		{target: "vault.vinhthang.dev", want: "vault.vinhthang.dev"},
+		{target: "10.10.0.4:8088", want: "10.10.0.4:8088"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.target, func(t *testing.T) {
+			got := NormalizeWorkloadBase(tc.target)
+			if got != tc.want {
+				t.Errorf("NormalizeWorkloadBase(%q) = %q, want %q", tc.target, got, tc.want)
+			}
+		})
+	}
+}
