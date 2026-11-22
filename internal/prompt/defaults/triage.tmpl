@@ -29,7 +29,7 @@ When to ESCALATE TO HUMAN instead of Fixer PR (VERDICT: ESCALATE_HUMAN):
 - Complex multi-component outages or application code bugs outside `charts/vinhthang-fleet/` and `caddy/Caddyfile`
 
 When to authorize Fixer PR (VERDICT: FIX_VIA_PR):
-- `Confidence` MUST be `HIGH`, root cause is verified against BOTH live Service/Workload state AND the Helm chart/Caddyfile, AND the fix is a minimal declarative edit inside `charts/vinhthang-fleet/` or `caddy/Caddyfile` (e.g., OOMKilled memory bump within node limits, broken port/selector/env/tag typo, Connection Refused route mismatch).
+- `Confidence` MUST be `HIGH`, root cause is verified against BOTH live Service/Workload state AND the Helm chart/Caddyfile, AND the fix is a minimal declarative edit inside `charts/vinhthang-fleet/` or `caddy/Caddyfile` (e.g., OOMKilled memory bump within node limits, CPU throttling limits, tight 1s probe `timeoutSeconds`, single-replica (`replicas: 1`) operator `--leader-elect` / `-leader-elect` lease-loss crash loops, broken port/selector/env/tag typo, Connection Refused route mismatch).
 </KNOWLEDGE>
 
 <SAFETY_RULES>
@@ -42,7 +42,7 @@ CRITICAL SECURITY REQUIREMENT:
 <METHODOLOGY>
 Follow these steps IN ORDER before emitting a conclusion:
 1. Noise, Recovery & Rollout Check: Is this a synthetic test alert, an ephemeral blip that already recovered in post-soak telemetry, or an active Helm rollout cycling cleanly?
-2. Service & Workload Check: Examine `=== Services & Endpoints ===`, `=== Namespace Workloads ===`, Pod status/restarts, previous logs, events, and any Edge HTTP/TLS probe (`Connection Refused`, `5xx`).
+2. Service & Workload Check: Examine `=== Services & Endpoints ===`, `=== Namespace Workloads ===`, `=== Container Termination & Restart Status ===` (`lastTerminated`, `exitCode`, `reason`), `=== Current Container Logs ===`, `=== Previous Container Logs ===`, events, and any Edge HTTP/TLS probe (`Connection Refused`, `5xx`).
 3. Helm Chart & Drift Check: Cross-reference `=== Helm Chart & Values Check ===` (`charts/vinhthang-fleet/values.yaml`, matched template files, recent git commits) against live Kubernetes specs to check whether desired declarative config drifted or has an explicit bug.
 4. Root Cause Conclusion & Fixability Classification: Assign `Confidence` (`HIGH`, `MEDIUM`, or `LOW`), state the exact conclusion, and emit `VERDICT: IGNORE`, `VERDICT: ESCALATE_HUMAN`, or `VERDICT: FIX_VIA_PR` (only if `Confidence` is `HIGH` and fixable via a bounded declarative change).
 </METHODOLOGY>

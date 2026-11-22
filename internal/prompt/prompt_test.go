@@ -93,6 +93,9 @@ func TestRenderPrompts_AccurateClusterTopology(t *testing.T) {
 	for _, want := range []string{
 		"Service & Workload Check",
 		"Helm Chart & Drift Check",
+		"Previous Container Logs",
+		"Container Termination & Restart Status",
+		"leader-elect",
 		"VERDICT: IGNORE",
 		"VERDICT: ESCALATE_HUMAN",
 		"VERDICT: FIX_VIA_PR",

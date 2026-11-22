@@ -329,4 +329,112 @@ fi
 	}
 }
 
+func TestFetchDiagnosticBundle_ResolvesWorkloadPodCrashLogsLastStateAndValuesKey(t *testing.T) {
+	binDir := t.TempDir()
+	wsDir := t.TempDir()
 
+	chartDir := filepath.Join(wsDir, "charts", "vinhthang-fleet")
+	tmplDir := filepath.Join(chartDir, "templates", "operators")
+	if err := os.MkdirAll(tmplDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	valuesYAML := "kube-state-metrics:\n  namespaceOverride: observability\n\nmongodbOperator:\n  enabled: true\n  resources:\n    limits:\n      cpu: 200m\n"
+	if err := os.WriteFile(filepath.Join(chartDir, "values.yaml"), []byte(valuesYAML), 0644); err != nil {
+		t.Fatal(err)
+	}
+	opTmpl := "{{- if .Values.mongodbOperator.enabled }}\nkind: Deployment\nmetadata:\n  name: psmdb-operator\n{{- end }}\n"
+	if err := os.WriteFile(filepath.Join(tmplDir, "psmdb-operator.yaml"), []byte(opTmpl), 0644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"init"},
+		{"config", "user.email", "test@vinhthang.dev"},
+		{"config", "user.name", "Test"},
+		{"add", "."},
+		{"commit", "-m", "feat(operators): add psmdb-operator manifest"},
+	} {
+		cmd := exec.Command("git", append([]string{"-C", wsDir}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %v (%s)", args, err, string(out))
+		}
+	}
+
+	kubectlScript := `#!/bin/sh
+case "$*" in
+  *"get deployment psmdb-operator -n operators -o json"*)
+    echo '{"spec":{"selector":{"matchLabels":{"app.kubernetes.io/name":"psmdb-operator"}},"template":{"spec":{"containers":[{"name":"psmdb-operator","image":"percona/percona-server-mongodb-operator:1.23.0","resources":{"limits":{"cpu":"200m","memory":"256Mi"}}}]}}}}'
+    ;;
+  *"get pods -n operators -l app.kubernetes.io/name=psmdb-operator -o json"*)
+    echo '{"items":[{"metadata":{"name":"healthy-pod"},"status":{"containerStatuses":[{"name":"psmdb-operator","ready":true,"restartCount":0}]}},{"metadata":{"name":"psmdb-operator-ff79d9fb9-qqwbl"},"status":{"containerStatuses":[{"name":"psmdb-operator","ready":false,"restartCount":13,"state":{"waiting":{"reason":"CrashLoopBackOff","message":"back-off 5m0s restarting failed container"}},"lastState":{"terminated":{"exitCode":1,"reason":"Error","finishedAt":"2026-11-21T20:11:38Z","message":"leader election lost"}}}]}}]}'
+    ;;
+  *"get pod psmdb-operator-ff79d9fb9-qqwbl -n operators -o json"*)
+    echo '{"metadata":{"name":"psmdb-operator-ff79d9fb9-qqwbl"},"status":{"containerStatuses":[{"name":"psmdb-operator","ready":false,"restartCount":13,"state":{"waiting":{"reason":"CrashLoopBackOff","message":"back-off 5m0s restarting failed container"}},"lastState":{"terminated":{"exitCode":1,"reason":"Error","finishedAt":"2026-11-21T20:11:38Z","message":"leader election lost"}}}]}}'
+    ;;
+  *"logs -n operators psmdb-operator-ff79d9fb9-qqwbl --previous --tail=50"*)
+    echo "Failed to renew lease: context deadline exceeded"
+    ;;
+  *"logs -n operators psmdb-operator-ff79d9fb9-qqwbl --tail=50"*)
+    echo "Attempting to acquire leader lease..."
+    ;;
+  *"describe pod psmdb-operator-ff79d9fb9-qqwbl"*)
+    echo "Name: psmdb-operator-ff79d9fb9-qqwbl"
+    ;;
+  *"get svc,endpoints"*)
+    echo "No resources found in operators namespace."
+    ;;
+  *"get deploy,sts,rs,pods"*)
+    echo "pod/psmdb-operator-ff79d9fb9-qqwbl 0/1 CrashLoopBackOff 13"
+    ;;
+  *"get events"*)
+    echo "7m Normal LeaderElection lease/08db0feb.percona.com"
+    ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(binDir, "kubectl"), []byte(kubectlScript), 0755); err != nil {
+		t.Fatal(err)
+	}
+	helmScript := `#!/bin/sh
+if [ "$1" = "lint" ]; then
+  echo "1 chart(s) linted, 0 chart(s) failed"
+fi
+`
+	if err := os.WriteFile(filepath.Join(binDir, "helm"), []byte(helmScript), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	labels := map[string]string{
+		"alertname":          "DeploymentReplicasUnavailable",
+		"exported_namespace": "operators",
+		"namespace":          "observability",
+		"pod":                "fleet-kube-state-metrics-6b6cd74c86-fq8mj",
+		"service":            "fleet-kube-state-metrics",
+		"deployment":         "psmdb-operator",
+	}
+
+	bundle := FetchDiagnosticBundle(labels, wsDir)
+
+	for _, want := range []string{
+		"=== Container Termination & Restart Status ===",
+		"psmdb-operator-ff79d9fb9-qqwbl",
+		"restartCount=13",
+		"exitCode=1",
+		"reason=Error",
+		"=== Current Container Logs ===",
+		"Attempting to acquire leader lease...",
+		"=== Previous Container Logs ===",
+		"Failed to renew lease: context deadline exceeded",
+		"mongodbOperator:",
+		"cpu: 200m",
+	} {
+		if !strings.Contains(bundle, want) {
+			t.Errorf("expected diagnostic bundle to contain %q, got:\n%s", want, bundle)
+		}
+	}
+
+	if helmIdx := strings.Index(bundle, "=== Helm Chart & Values Check ==="); helmIdx >= 0 {
+		if strings.Contains(bundle[helmIdx:], "kube-state-metrics:") {
+			t.Errorf("expected Helm values check to skip scraper label kube-state-metrics, got:\n%s", bundle[helmIdx:])
+		}
+	}
+}

@@ -11,12 +11,16 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 	"time"
 
 	"vinhthang.dev/ai-incident-commander/internal/incident"
 	"vinhthang.dev/ai-incident-commander/internal/workspace"
 )
+
+var helmValuesKeyRe = regexp.MustCompile(`\.Values\.([A-Za-z0-9_]+)`)
 
 // WorkloadStatus summarizes whether a target resource is actively rolling out
 // or has already recovered after stabilization soak.
@@ -33,6 +37,9 @@ type k8sWorkloadSpec struct {
 	} `json:"metadata"`
 	Spec struct {
 		Replicas *int32 `json:"replicas"`
+		Selector struct {
+			MatchLabels map[string]string `json:"matchLabels"`
+		} `json:"selector"`
 		Template struct {
 			Spec struct {
 				Containers []struct {
@@ -58,6 +65,43 @@ type k8sWorkloadSpec struct {
 			Reason string `json:"reason"`
 		} `json:"conditions"`
 	} `json:"status"`
+}
+
+type k8sContainerState struct {
+	Waiting *struct {
+		Reason  string `json:"reason"`
+		Message string `json:"message"`
+	} `json:"waiting"`
+	Terminated *struct {
+		ExitCode   int    `json:"exitCode"`
+		Signal     int    `json:"signal"`
+		Reason     string `json:"reason"`
+		Message    string `json:"message"`
+		FinishedAt string `json:"finishedAt"`
+	} `json:"terminated"`
+}
+
+type k8sContainerStatus struct {
+	Name         string            `json:"name"`
+	Ready        bool              `json:"ready"`
+	RestartCount int               `json:"restartCount"`
+	State        k8sContainerState `json:"state"`
+	LastState    k8sContainerState `json:"lastState"`
+}
+
+type k8sPodStatusSpec struct {
+	Metadata struct {
+		Name string `json:"name"`
+	} `json:"metadata"`
+	Status struct {
+		Phase                 string               `json:"phase"`
+		InitContainerStatuses []k8sContainerStatus `json:"initContainerStatuses"`
+		ContainerStatuses     []k8sContainerStatus `json:"containerStatuses"`
+	} `json:"status"`
+}
+
+type k8sPodListSpec struct {
+	Items []k8sPodStatusSpec `json:"items"`
 }
 
 // CheckWorkloadStatus inspects live Deployment/StatefulSet rollout status or HTTP endpoint
@@ -128,11 +172,16 @@ func FetchDiagnosticBundle(labels map[string]string, workspaceDir string) string
 	kind, workloadName := resolveTargetWorkload(labels)
 
 	if namespace != "" {
+		if pod == "" && kind != "" && workloadName != "" {
+			_, pod = resolveWorkloadSelectorAndPod(namespace, kind, workloadName)
+		}
 		appendKubectlTelemetry(&builder, "Services & Endpoints", 60, "get", "svc,endpoints", "-n", namespace, "-o", "wide")
 		appendKubectlTelemetry(&builder, "Namespace Workloads", 80, "get", "deploy,sts,rs,pods", "-n", namespace, "-o", "wide")
 		if pod != "" {
+			appendPodTerminationSummary(&builder, namespace, pod)
 			appendKubectlTelemetry(&builder, "Pod Describe", 80, "describe", "pod", pod, "-n", namespace)
-			appendKubectlTelemetry(&builder, "Previous Container Logs", 30, "logs", "-n", namespace, pod, "--previous", "--tail=30")
+			appendKubectlTelemetry(&builder, "Current Container Logs", 50, "logs", "-n", namespace, pod, "--tail=50")
+			appendKubectlTelemetry(&builder, "Previous Container Logs", 50, "logs", "-n", namespace, pod, "--previous", "--tail=50")
 			appendKubectlTelemetry(&builder, "Recent Namespace Events", 30, "get", "events", "-n", namespace, "--sort-by=.lastTimestamp")
 		}
 		if kind != "" && workloadName != "" {
@@ -145,6 +194,98 @@ func FetchDiagnosticBundle(labels map[string]string, workspaceDir string) string
 	}
 
 	return builder.String()
+}
+
+func resolveWorkloadSelectorAndPod(namespace, kind, workloadName string) (string, string) {
+	selector := "app=" + workloadName
+	if out, err := exec.Command("kubectl", "get", kind, workloadName, "-n", namespace, "-o", "json").CombinedOutput(); err == nil {
+		var w k8sWorkloadSpec
+		if jsonErr := json.Unmarshal(out, &w); jsonErr == nil && len(w.Spec.Selector.MatchLabels) > 0 {
+			keys := make([]string, 0, len(w.Spec.Selector.MatchLabels))
+			for k := range w.Spec.Selector.MatchLabels {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			parts := make([]string, 0, len(keys))
+			for _, k := range keys {
+				parts = append(parts, fmt.Sprintf("%s=%s", k, w.Spec.Selector.MatchLabels[k]))
+			}
+			selector = strings.Join(parts, ",")
+		}
+	}
+
+	podsOut, err := exec.Command("kubectl", "get", "pods", "-n", namespace, "-l", selector, "-o", "json").CombinedOutput()
+	if err != nil {
+		return selector, ""
+	}
+	var podList k8sPodListSpec
+	if jsonErr := json.Unmarshal(podsOut, &podList); jsonErr != nil || len(podList.Items) == 0 {
+		return selector, ""
+	}
+
+	bestName := ""
+	bestScore := -1
+	for _, p := range podList.Items {
+		score := scorePodForTriage(p)
+		if score > bestScore || (score == bestScore && (bestName == "" || p.Metadata.Name < bestName)) {
+			bestScore = score
+			bestName = p.Metadata.Name
+		}
+	}
+	return selector, bestName
+}
+
+func scorePodForTriage(p k8sPodStatusSpec) int {
+	score := 0
+	allStatuses := append(append([]k8sContainerStatus{}, p.Status.InitContainerStatuses...), p.Status.ContainerStatuses...)
+	for _, cs := range allStatuses {
+		if !cs.Ready {
+			score += 1000
+		}
+		if cs.State.Waiting != nil && cs.State.Waiting.Reason != "" {
+			score += 500
+		}
+		if cs.LastState.Terminated != nil {
+			score += 200
+		}
+		score += cs.RestartCount
+	}
+	return score
+}
+
+func appendPodTerminationSummary(builder *strings.Builder, namespace, pod string) {
+	out, err := exec.Command("kubectl", "get", "pod", pod, "-n", namespace, "-o", "json").CombinedOutput()
+	if err != nil {
+		return
+	}
+	var p k8sPodStatusSpec
+	if jsonErr := json.Unmarshal(out, &p); jsonErr != nil {
+		return
+	}
+	allStatuses := append(append([]k8sContainerStatus{}, p.Status.InitContainerStatuses...), p.Status.ContainerStatuses...)
+	if len(allStatuses) == 0 {
+		return
+	}
+	builder.WriteString("=== Container Termination & Restart Status ===\n")
+	fmt.Fprintf(builder, "Pod: %s (phase=%s)\n", pod, p.Status.Phase)
+	for _, cs := range allStatuses {
+		fmt.Fprintf(builder, "- container=%s ready=%t restartCount=%d", cs.Name, cs.Ready, cs.RestartCount)
+		if cs.State.Waiting != nil {
+			fmt.Fprintf(builder, " waiting=(reason=%s message=%q)", cs.State.Waiting.Reason, cs.State.Waiting.Message)
+		}
+		if cs.State.Terminated != nil {
+			fmt.Fprintf(builder, " terminated=(reason=%s exitCode=%d signal=%d finishedAt=%s message=%q)",
+				cs.State.Terminated.Reason, cs.State.Terminated.ExitCode, cs.State.Terminated.Signal,
+				cs.State.Terminated.FinishedAt, cs.State.Terminated.Message)
+		}
+		if cs.LastState.Terminated != nil {
+			fmt.Fprintf(builder, " lastTerminated=(reason=%s exitCode=%d signal=%d finishedAt=%s message=%q)",
+				cs.LastState.Terminated.Reason, cs.LastState.Terminated.ExitCode, cs.LastState.Terminated.Signal,
+				cs.LastState.Terminated.FinishedAt, cs.LastState.Terminated.Message)
+		}
+		builder.WriteString("\n")
+	}
+	builder.WriteString("\n")
 }
 
 func appendLiveWorkloadSpec(builder *strings.Builder, namespace, kind, name string) {
@@ -200,7 +341,8 @@ func appendHelmDiagnostics(builder *strings.Builder, labels map[string]string, w
 	}
 
 	valuesPath := filepath.Join(chartDir, "values.yaml")
-	if snippet := extractValuesSection(valuesPath, candidates, 60); snippet != "" {
+	valueTokens := extractTemplateValuesTokens(workspaceDir, matchedTemplates, candidates)
+	if snippet := extractValuesSection(valuesPath, valueTokens, 60); snippet != "" {
 		builder.WriteString("Relevant values.yaml section:\n")
 		builder.WriteString(snippet)
 		if !strings.HasSuffix(snippet, "\n") {
@@ -226,13 +368,46 @@ func appendHelmDiagnostics(builder *strings.Builder, labels map[string]string, w
 	builder.WriteString("\n")
 }
 
+func extractTemplateValuesTokens(workspaceDir string, matchedTemplates, fallback []string) []string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, rel := range matchedTemplates {
+		data, err := os.ReadFile(filepath.Join(workspaceDir, rel))
+		if err != nil {
+			continue
+		}
+		for _, m := range helmValuesKeyRe.FindAllStringSubmatch(string(data), -1) {
+			if len(m) < 2 {
+				continue
+			}
+			norm := normalizeToken(m[1])
+			if norm == "" || norm == "global" || seen[norm] {
+				continue
+			}
+			seen[norm] = true
+			out = append(out, norm)
+		}
+	}
+	for _, tok := range fallback {
+		if tok != "" && !seen[tok] {
+			seen[tok] = true
+			out = append(out, tok)
+		}
+	}
+	return out
+}
+
 func helmMatchTokens(labels map[string]string, target string) []string {
 	raw := []string{
 		labels["deployment"],
 		labels["statefulset"],
-		labels["app"],
-		labels["service"],
 		target,
+	}
+	if !incident.IsMetricsScraperLabel(labels["app"]) {
+		raw = append(raw, labels["app"])
+	}
+	if !incident.IsMetricsScraperLabel(labels["service"]) {
+		raw = append(raw, labels["service"])
 	}
 	seen := make(map[string]bool)
 	var out []string
@@ -351,9 +526,10 @@ func FetchTelemetry(labels map[string]string) string {
 	} else if namespace != "" {
 		// 3. Workload Tier fallback (Deployment / StatefulSet) when pod is absent or shadowed by a scraper label
 		if kind, name := resolveTargetWorkload(labels); kind != "" && name != "" {
+			selector, _ := resolveWorkloadSelectorAndPod(namespace, kind, name)
 			fmt.Fprintf(&builder, "Telemetry for %s %s in Namespace %s:\n\n", kind, name, namespace)
 			appendKubectlTelemetry(&builder, "Describe "+kind, 0, "describe", kind, name, "-n", namespace)
-			appendKubectlTelemetry(&builder, "Workload Pods", 0, "get", "pods", "-n", namespace, "-l", "app="+name)
+			appendKubectlTelemetry(&builder, "Workload Pods", 0, "get", "pods", "-n", namespace, "-l", selector)
 			appendKubectlTelemetry(&builder, "Recent Namespace Events", 30, "get", "events", "-n", namespace, "--sort-by=.lastTimestamp")
 		}
 	}
