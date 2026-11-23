@@ -5,6 +5,7 @@
 *.so
 *.dylib
 bin/
+/commander
 incident-commander
 ai-incident-commander
 

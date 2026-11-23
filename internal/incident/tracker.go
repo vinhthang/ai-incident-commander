@@ -1,10 +1,12 @@
 package incident
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"log"
 	"regexp"
 	"strings"
 	"time"
@@ -187,6 +189,28 @@ func ResolveClusterIncident(fingerprint string) (closedIssue int, err error) {
 	}
 
 	return issueNumber, nil
+}
+
+// ReconcileClosedClusterIssue checks whether a tracked GitHub issue is still open.
+// If the issue was manually closed, it marks the cluster incident resolved and returns false.
+// On lookup errors, it conservatively returns true so duplicate suppression remains intact.
+func ReconcileClosedClusterIssue(ctx context.Context, fingerprint string, existingIssue int, isOpenFn func(context.Context, int) (bool, error)) bool {
+	if existingIssue <= 0 || isOpenFn == nil {
+		return true
+	}
+	open, err := isOpenFn(ctx, existingIssue)
+	if err != nil {
+		log.Printf("⚠️ Failed verifying GitHub state for issue #%d (%s): %v", existingIssue, fingerprint, err)
+		return true
+	}
+	if open {
+		return true
+	}
+	if _, resolveErr := ResolveClusterIncident(fingerprint); resolveErr != nil {
+		log.Printf("⚠️ Failed reconciling closed issue #%d (%s) to resolved in DB: %v", existingIssue, fingerprint, resolveErr)
+	}
+	log.Printf("🔄 Reconciled manually closed GitHub issue #%d (%s) to resolved in DB.", existingIssue, fingerprint)
+	return false
 }
 
 // SummarizeRecentIncidents returns a concise summary of recent cluster and application

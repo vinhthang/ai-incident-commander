@@ -40,18 +40,33 @@ func AcquireResolveLock(incidentKey string) bool {
 	StateMu.Lock()
 	defer StateMu.Unlock()
 
+	now := time.Now()
+	pruneExpiredLocked(now)
 	notifyResolvedLocked(incidentKey)
 
-	if lastResolved, ok := resolvedDebounce[incidentKey]; ok && time.Since(lastResolved) < resolveDebounceWindow {
-		log.Printf("Incident %s resolved webhook debounced (last handled %s ago).", incidentKey, time.Since(lastResolved).Round(time.Second))
+	if lastResolved, ok := resolvedDebounce[incidentKey]; ok && now.Sub(lastResolved) < resolveDebounceWindow {
+		log.Printf("Incident %s resolved webhook debounced (last handled %s ago).", incidentKey, now.Sub(lastResolved).Round(time.Second))
 		return false
 	}
-	resolvedDebounce[incidentKey] = time.Now()
+	resolvedDebounce[incidentKey] = now
 
 	if st, exists := ActiveIncidents[incidentKey]; exists {
 		st.Status = "RESOLVING"
 	}
 	return true
+}
+
+func pruneExpiredLocked(now time.Time) {
+	for fp, ts := range resolvedDebounce {
+		if now.Sub(ts) >= resolveDebounceWindow {
+			delete(resolvedDebounce, fp)
+		}
+	}
+	for fp, st := range ActiveIncidents {
+		if st == nil || (st.Status == "COOLING_DOWN" && now.Sub(st.LastAttempt) >= config.CooldownMins) {
+			delete(ActiveIncidents, fp)
+		}
+	}
 }
 
 // NotifyResolved wakes and cancels any active soak wait for incidentKey.
@@ -129,6 +144,9 @@ func AcquireIncidentLock(incidentKey, status string) bool {
 	StateMu.Lock()
 	defer StateMu.Unlock()
 
+	now := time.Now()
+	pruneExpiredLocked(now)
+
 	state, exists := ActiveIncidents[incidentKey]
 	if !exists {
 		if status == "resolved" {
@@ -136,7 +154,7 @@ func AcquireIncidentLock(incidentKey, status string) bool {
 		}
 		ActiveIncidents[incidentKey] = &IncidentState{
 			AttemptCount: 0,
-			LastAttempt:  time.Now(),
+			LastAttempt:  now,
 			Status:       "TRIAGING",
 		}
 		return true

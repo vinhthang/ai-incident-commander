@@ -160,3 +160,67 @@ func TestWaitForSoak_CompletesFullWindowWhenNotResolved(t *testing.T) {
 		t.Fatalf("expected WaitForSoak to sleep >= 35ms, elapsed %v", elapsed)
 	}
 }
+
+func TestPruneExpiredCooldownAndResolveDebounce(t *testing.T) {
+	resetState()
+	ClearResolveDebounceForTest()
+
+	now := time.Now()
+	StateMu.Lock()
+	ActiveIncidents["stale-cooldown"] = &IncidentState{
+		Status:      "COOLING_DOWN",
+		LastAttempt: now.Add(-10 * time.Minute),
+	}
+	ActiveIncidents["fresh-cooldown"] = &IncidentState{
+		Status:      "COOLING_DOWN",
+		LastAttempt: now.Add(-1 * time.Minute),
+	}
+	ActiveIncidents["active-fixing"] = &IncidentState{
+		Status:      "FIXING",
+		LastAttempt: now.Add(-10 * time.Minute),
+	}
+	resolvedDebounce["stale-resolved"] = now.Add(-5 * time.Minute)
+	resolvedDebounce["fresh-resolved"] = now.Add(-10 * time.Second)
+	StateMu.Unlock()
+
+	if !AcquireIncidentLock("fresh-fp", "firing") {
+		t.Fatalf("expected AcquireIncidentLock to succeed for fresh-fp")
+	}
+
+	StateMu.RLock()
+	if _, ok := ActiveIncidents["stale-cooldown"]; ok {
+		t.Errorf("expected expired COOLING_DOWN entry to be pruned")
+	}
+	if _, ok := ActiveIncidents["fresh-cooldown"]; !ok {
+		t.Errorf("expected fresh COOLING_DOWN entry to be preserved")
+	}
+	if _, ok := ActiveIncidents["active-fixing"]; !ok {
+		t.Errorf("expected active FIXING entry to be preserved")
+	}
+	if _, ok := ActiveIncidents["fresh-fp"]; !ok {
+		t.Errorf("expected newly acquired fresh-fp entry to exist")
+	}
+	if _, ok := resolvedDebounce["stale-resolved"]; ok {
+		t.Errorf("expected expired resolvedDebounce entry to be pruned")
+	}
+	if _, ok := resolvedDebounce["fresh-resolved"]; !ok {
+		t.Errorf("expected fresh resolvedDebounce entry to be preserved")
+	}
+	StateMu.RUnlock()
+
+	// Verify WaitForSoak edge cases: non-positive duration and cancelled context
+	if WaitForSoak(context.Background(), "fresh-fp", 0) {
+		t.Errorf("expected WaitForSoak with 0 duration to return false")
+	}
+	cancelledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if !WaitForSoak(cancelledCtx, "fresh-fp", 5*time.Second) {
+		t.Errorf("expected WaitForSoak with cancelled context to return true")
+	}
+	if !HasActiveIncident("fresh-fp") {
+		t.Errorf("expected HasActiveIncident(fresh-fp) == true")
+	}
+	if HasActiveIncident("missing-fp") {
+		t.Errorf("expected HasActiveIncident(missing-fp) == false")
+	}
+}

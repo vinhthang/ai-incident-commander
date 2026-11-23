@@ -129,3 +129,94 @@ func TestRenderDailyReportPrompt_ReadOnlyConstraints(t *testing.T) {
 		}
 	}
 }
+
+func TestRenderPrompts_PreservesUnescapedDiffsAndTelemetry(t *testing.T) {
+	rawSamples := []string{
+		`<nil>`,
+		`a && b`,
+		`"nginx:1.27.0"`,
+		`'quoted'`,
+		`+ memory: "512Mi"`,
+	}
+	payload := strings.Join(rawSamples, "\n")
+
+	cases := []struct {
+		name   string
+		render func() (string, error)
+	}{
+		{
+			name: "triage",
+			render: func() (string, error) {
+				return RenderTriagePrompt(TriageData{
+					AlertName: "PodCrashLoopBackOff",
+					Telemetry: payload,
+				})
+			},
+		},
+		{
+			name: "fixer",
+			render: func() (string, error) {
+				return RenderFixerPrompt(FixerData{
+					IssueNumber:    12,
+					BranchName:     "fix/alert-12",
+					AlertName:      "PodCrashLoopBackOff",
+					Diagnosis:      payload,
+					Telemetry:      payload,
+					ReviewFeedback: payload,
+				})
+			},
+		},
+		{
+			name: "senior_fixer",
+			render: func() (string, error) {
+				return RenderSeniorFixerPrompt(SeniorFixerData{
+					IssueNumber: 12,
+					BranchName:  "fix/alert-12",
+					Diagnosis:   payload,
+					LocalDiff:   payload,
+				})
+			},
+		},
+		{
+			name: "reviewer",
+			render: func() (string, error) {
+				return RenderReviewerPrompt(ReviewerData{
+					PRNumber:          15,
+					BranchName:        "fix/alert-12",
+					OriginalDiagnosis: payload,
+					PRDiff:            payload,
+				})
+			},
+		},
+		{
+			name: "daily_report",
+			render: func() (string, error) {
+				return RenderDailyReportPrompt(DailyReportData{
+					Date:            "2026-11-22",
+					Snapshot:        payload,
+					IncidentSummary: payload,
+				})
+			},
+		},
+	}
+
+	escapedEntities := []string{"&lt;", "&gt;", "&amp;", "&#34;", "&#39;"}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := tc.render()
+			if err != nil {
+				t.Fatalf("render failed: %v", err)
+			}
+			for _, raw := range rawSamples {
+				if !strings.Contains(out, raw) {
+					t.Errorf("%s prompt did not preserve raw substring %q:\n%s", tc.name, raw, out)
+				}
+			}
+			for _, ent := range escapedEntities {
+				if strings.Contains(out, ent) {
+					t.Errorf("%s prompt HTML-escaped entity %q:\n%s", tc.name, ent, out)
+				}
+			}
+		})
+	}
+}

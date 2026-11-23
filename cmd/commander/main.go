@@ -14,6 +14,7 @@ import (
 	"vinhthang.dev/ai-incident-commander/internal/config"
 	"vinhthang.dev/ai-incident-commander/internal/db"
 	"vinhthang.dev/ai-incident-commander/internal/github"
+	"vinhthang.dev/ai-incident-commander/internal/metrics"
 	"vinhthang.dev/ai-incident-commander/internal/minion"
 	"vinhthang.dev/ai-incident-commander/internal/webhook"
 	"vinhthang.dev/ai-incident-commander/internal/workspace"
@@ -83,6 +84,7 @@ func main() {
 	mux.HandleFunc("/webhook", webhook.HandleWebhook)
 	mux.HandleFunc("/daily-report", webhook.HandleDailyReport)
 	mux.HandleFunc("/healthz", webhook.HandleHealthz)
+	mux.HandleFunc("/metrics", metrics.HandleMetrics)
 
 	port := os.Getenv("PORT")
 	if port == "" {

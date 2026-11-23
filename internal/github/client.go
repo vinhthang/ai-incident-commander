@@ -13,7 +13,18 @@ import (
 	"vinhthang.dev/ai-incident-commander/internal/config"
 )
 
-var Client *github.Client
+var (
+	Client     *github.Client
+	APIBaseURL = "https://api.github.com"
+	HTTPClient = &http.Client{Timeout: 30 * time.Second}
+)
+
+func contextOrBackground(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
+}
 
 func InitClient() {
 	ctx := context.Background()
@@ -22,17 +33,17 @@ func InitClient() {
 	Client = github.NewClient(tc)
 }
 
-func CreateIssue(title, body string, labels []string) (*github.Issue, error) {
+func CreateIssue(ctx context.Context, title, body string, labels []string) (*github.Issue, error) {
 	req := &github.IssueRequest{
 		Title:  github.String(title),
 		Body:   github.String(body),
 		Labels: &labels,
 	}
-	issue, _, err := Client.Issues.Create(context.Background(), config.GithubOwner, config.GithubRepo, req)
+	issue, _, err := Client.Issues.Create(contextOrBackground(ctx), config.GithubOwner, config.GithubRepo, req)
 	return issue, err
 }
 
-func CreatePullRequest(branchName, title, body string) (*github.PullRequest, error) {
+func CreatePullRequest(ctx context.Context, branchName, title, body string) (*github.PullRequest, error) {
 	newPR := &github.NewPullRequest{
 		Title:               github.String(title),
 		Head:                github.String(branchName),
@@ -40,60 +51,88 @@ func CreatePullRequest(branchName, title, body string) (*github.PullRequest, err
 		Body:                github.String(body),
 		MaintainerCanModify: github.Bool(true),
 	}
-	pr, _, err := Client.PullRequests.Create(context.Background(), config.GithubOwner, config.GithubRepo, newPR)
+	pr, _, err := Client.PullRequests.Create(contextOrBackground(ctx), config.GithubOwner, config.GithubRepo, newPR)
 	return pr, err
 }
 
-func GetPullRequestDiff(prNumber int) (string, error) {
-	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/pulls/%d", config.GithubOwner, config.GithubRepo, prNumber)
-	req, _ := http.NewRequest("GET", url, nil)
-	req.Header.Set("Authorization", "token "+config.GithubToken)
+func GetPullRequestDiff(ctx context.Context, prNumber int) (string, error) {
+	base := strings.TrimRight(APIBaseURL, "/")
+	url := fmt.Sprintf("%s/repos/%s/%s/pulls/%d", base, config.GithubOwner, config.GithubRepo, prNumber)
+	req, err := http.NewRequestWithContext(contextOrBackground(ctx), http.MethodGet, url, nil)
+	if err != nil {
+		return "", fmt.Errorf("build PR diff request for #%d: %w", prNumber, err)
+	}
+	if config.GithubToken != "" {
+		req.Header.Set("Authorization", "Bearer "+config.GithubToken)
+	}
 	req.Header.Set("Accept", "application/vnd.github.v3.diff")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := HTTPClient.Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	bodyBytes, err := io.ReadAll(resp.Body)
-	return string(bodyBytes), err
+	bodyBytes, readErr := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if readErr != nil {
+		return "", fmt.Errorf("read PR #%d diff body: %w", prNumber, readErr)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("fetch PR #%d diff failed: HTTP %d: %s", prNumber, resp.StatusCode, strings.TrimSpace(string(bodyBytes)))
+	}
+	return string(bodyBytes), nil
 }
 
-func MergePullRequest(prNumber int) error {
-	_, _, err := Client.PullRequests.Merge(context.Background(), config.GithubOwner, config.GithubRepo, prNumber, "Auto-merged by AI Incident Commander Reviewer", nil)
+// IsIssueOpen reports whether the given GitHub issue is currently in the "open" state.
+func IsIssueOpen(ctx context.Context, issueNumber int) (bool, error) {
+	if Client == nil || issueNumber <= 0 {
+		return false, nil
+	}
+	issue, _, err := Client.Issues.Get(contextOrBackground(ctx), config.GithubOwner, config.GithubRepo, issueNumber)
+	if err != nil {
+		return false, err
+	}
+	if issue == nil {
+		return false, nil
+	}
+	return strings.EqualFold(issue.GetState(), "open"), nil
+}
+
+func MergePullRequest(ctx context.Context, prNumber int) error {
+	_, _, err := Client.PullRequests.Merge(contextOrBackground(ctx), config.GithubOwner, config.GithubRepo, prNumber, "Auto-merged by AI Incident Commander Reviewer", nil)
 	return err
 }
 
-func AddIssueComment(issueNumber int, comment string) error {
-	_, _, err := Client.Issues.CreateComment(context.Background(), config.GithubOwner, config.GithubRepo, issueNumber, &github.IssueComment{Body: github.String(comment)})
+func AddIssueComment(ctx context.Context, issueNumber int, comment string) error {
+	_, _, err := Client.Issues.CreateComment(contextOrBackground(ctx), config.GithubOwner, config.GithubRepo, issueNumber, &github.IssueComment{Body: github.String(comment)})
 	return err
 }
 
-func AssignIssueOrPR(number int, assignee string) error {
-	_, _, err := Client.Issues.AddAssignees(context.Background(), config.GithubOwner, config.GithubRepo, number, []string{assignee})
+func AssignIssueOrPR(ctx context.Context, number int, assignee string) error {
+	_, _, err := Client.Issues.AddAssignees(contextOrBackground(ctx), config.GithubOwner, config.GithubRepo, number, []string{assignee})
 	return err
 }
 
-func CloseIssue(issueNumber int, comment string) error {
+func CloseIssue(ctx context.Context, issueNumber int, comment string) error {
+	ctx = contextOrBackground(ctx)
 	if comment != "" {
-		_ = AddIssueComment(issueNumber, comment)
+		_ = AddIssueComment(ctx, issueNumber, comment)
 	}
 	state := "closed"
 	req := &github.IssueRequest{
 		State: &state,
 	}
-	_, _, err := Client.Issues.Edit(context.Background(), config.GithubOwner, config.GithubRepo, issueNumber, req)
+	_, _, err := Client.Issues.Edit(ctx, config.GithubOwner, config.GithubRepo, issueNumber, req)
 	return err
 }
 
-func FindOpenIssueByTitle(titlePrefix string) (*github.Issue, error) {
+func FindOpenIssueByTitle(ctx context.Context, titlePrefix string) (*github.Issue, error) {
 	opts := &github.IssueListByRepoOptions{
 		State:       "open",
 		Labels:      []string{"ai-incident"},
 		ListOptions: github.ListOptions{PerPage: 50},
 	}
-	issues, _, err := Client.Issues.ListByRepo(context.Background(), config.GithubOwner, config.GithubRepo, opts)
+	issues, _, err := Client.Issues.ListByRepo(contextOrBackground(ctx), config.GithubOwner, config.GithubRepo, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -151,7 +190,7 @@ func targetNeedles(namespace, target, workloadBase string) []string {
 
 // FindOpenIssueForTarget returns an open ai-incident GitHub Issue referencing the same
 // namespace/target or normalized workload base (ignoring PRs), preventing duplicate issues across alerts.
-func FindOpenIssueForTarget(namespace, target, workloadBase string) (*github.Issue, error) {
+func FindOpenIssueForTarget(ctx context.Context, namespace, target, workloadBase string) (*github.Issue, error) {
 	if Client == nil {
 		return nil, nil
 	}
@@ -160,7 +199,7 @@ func FindOpenIssueForTarget(namespace, target, workloadBase string) (*github.Iss
 		Labels:      []string{"ai-incident"},
 		ListOptions: github.ListOptions{PerPage: 50},
 	}
-	issues, _, err := Client.Issues.ListByRepo(context.Background(), config.GithubOwner, config.GithubRepo, opts)
+	issues, _, err := Client.Issues.ListByRepo(contextOrBackground(ctx), config.GithubOwner, config.GithubRepo, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -182,7 +221,7 @@ func FindOpenIssueForTarget(namespace, target, workloadBase string) (*github.Iss
 
 // FindOpenPRForTarget returns an open autonomous fix PR (head ref fix/alert-*) targeting the same
 // namespace/target or workload base so subsequent alerts do not create redundant fix PRs.
-func FindOpenPRForTarget(namespace, target, workloadBase string) (*github.PullRequest, error) {
+func FindOpenPRForTarget(ctx context.Context, namespace, target, workloadBase string) (*github.PullRequest, error) {
 	if Client == nil {
 		return nil, nil
 	}
@@ -190,7 +229,7 @@ func FindOpenPRForTarget(namespace, target, workloadBase string) (*github.PullRe
 		State:       "open",
 		ListOptions: github.ListOptions{PerPage: 50},
 	}
-	prs, _, err := Client.PullRequests.List(context.Background(), config.GithubOwner, config.GithubRepo, opts)
+	prs, _, err := Client.PullRequests.List(contextOrBackground(ctx), config.GithubOwner, config.GithubRepo, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -314,4 +353,3 @@ func WaitForPRChecks(ctx context.Context, prNumber int, pollInterval, timeout ti
 		}
 	}
 }
-

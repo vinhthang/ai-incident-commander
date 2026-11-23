@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -19,10 +20,14 @@ import (
 	"vinhthang.dev/ai-incident-commander/internal/github"
 	"vinhthang.dev/ai-incident-commander/internal/incident"
 	"vinhthang.dev/ai-incident-commander/internal/k8s"
+	"vinhthang.dev/ai-incident-commander/internal/metrics"
 	"vinhthang.dev/ai-incident-commander/internal/minion"
 	"vinhthang.dev/ai-incident-commander/internal/state"
 	"vinhthang.dev/ai-incident-commander/internal/workspace"
 )
+
+// MaxWebhookBodyBytes caps Grafana webhook JSON payloads at 2 MiB.
+const MaxWebhookBodyBytes = 2 << 20
 
 type GrafanaAlertPayload struct {
 	Status string `json:"status"`
@@ -36,6 +41,11 @@ type GrafanaAlertPayload struct {
 var tracer = otel.Tracer("ai-incident-commander/webhook")
 
 func HandleWebhook(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	if config.WebhookAuthToken != "" && !isAuthorizedBearerToken(r.Header.Get("Authorization"), config.WebhookAuthToken) {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
@@ -44,10 +54,16 @@ func HandleWebhook(w http.ResponseWriter, r *http.Request) {
 	ctx, span := tracer.Start(r.Context(), "HandleWebhook")
 	defer span.End()
 
+	r.Body = http.MaxBytesReader(w, r.Body, MaxWebhookBodyBytes)
 	var payload GrafanaAlertPayload
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 		span.RecordError(err)
 		span.SetStatus(1, err.Error()) // 1 = Error
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -55,6 +71,15 @@ func HandleWebhook(w http.ResponseWriter, r *http.Request) {
 	span.SetAttributes(attribute.Int("alerts.count", len(payload.Alerts)))
 
 	for _, alert := range payload.Alerts {
+		alertStatus := alert.Status
+		if alertStatus == "" {
+			alertStatus = payload.Status
+		}
+		if alertStatus == "" {
+			alertStatus = "unknown"
+		}
+		metrics.IncAlertsReceived(alertStatus)
+
 		alertName := alert.Labels["alertname"]
 		if alertName == "" {
 			alertName = "UnknownAlert"
@@ -78,7 +103,7 @@ func HandleWebhook(w http.ResponseWriter, r *http.Request) {
 			defer cancel()
 
 			processAlert(bgCtx, aStatus, aName, aLabels, aAnnotations, wasActive)
-		}(context.WithoutCancel(ctx), alert.Status, alertName, alert.Labels, alert.Annotations)
+		}(context.WithoutCancel(ctx), alertStatus, alertName, alert.Labels, alert.Annotations)
 	}
 
 	w.WriteHeader(http.StatusOK)
@@ -167,17 +192,17 @@ func processAlert(ctx context.Context, status, alertName string, labels, annotat
 		}
 		if closedIssue > 0 {
 			comment := fmt.Sprintf("✅ Alert %s (%s/%s) resolved: Cluster telemetry confirmed healthy.", alertName, namespace, target)
-			if err := github.CloseIssue(closedIssue, comment); err != nil {
+			if err := github.CloseIssue(ctx, closedIssue, comment); err != nil {
 				log.Printf("Failed to close issue #%d: %v", closedIssue, err)
 			}
 		} else if wasActive {
 			titlePrefix := fmt.Sprintf("[Alert] %s: %s/%s", alertName, namespace, target)
-			issue, err := github.FindOpenIssueByTitle(titlePrefix)
+			issue, err := github.FindOpenIssueByTitle(ctx, titlePrefix)
 			if err != nil {
 				log.Printf("Failed searching open issue by title prefix %s: %v", titlePrefix, err)
 			} else if issue != nil {
 				comment := fmt.Sprintf("✅ Alert %s (%s/%s) resolved: Cluster telemetry confirmed healthy.", alertName, namespace, target)
-				if err := github.CloseIssue(issue.GetNumber(), comment); err != nil {
+				if err := github.CloseIssue(ctx, issue.GetNumber(), comment); err != nil {
 					log.Printf("Failed to close found issue #%d: %v", issue.GetNumber(), err)
 				}
 			}
@@ -218,29 +243,36 @@ func processAlert(ctx context.Context, status, alertName string, labels, annotat
 			return
 		}
 
-		// 2. Fetch Telemetry and Run Triage for new incident
+		// 2. Fetch Telemetry (including VictoriaLogs context) and Run Triage for new incident
 		span.AddEvent("Fetching Telemetry")
 		telemetry := k8s.FetchTelemetry(labels)
+		if vlLogs := k8s.FetchVictoriaLogsContext(ctx, config.VictoriaLogsURL, serviceName, traceID); vlLogs != "" {
+			telemetry += "\n" + vlLogs
+		}
 
 		log.Printf("New app alert %s. Running Triage Minion...", alertName)
 		span.AddEvent("Running Triage Minion")
 		diagnosis := minion.RunTriage(ctx, alertName, labels, annotations, telemetry)
 
-		state := "open"
+		appState := "open"
 		if diagnosis == "IGNORED" || minion.IsIgnored(diagnosis) {
 			log.Printf("Triage Minion ignored app alert %s. Saving state as ignored.", alertName)
 			span.AddEvent("Alert IGNORED by Triage Minion.")
-			state = "ignored"
+			appState = "ignored"
+			metrics.IncTriageVerdict(string(minion.ActionIgnore))
+		} else {
+			metrics.IncTriageVerdict("APP_INCIDENT")
 		}
 
-		// 3. Save new incident to database
-		err = minion.SaveNewAppIncident(serviceName, endpointOrTopic, statusCode, traceID, state, diagnosis)
+		// 3. Save new incident to database and notify Memos / GitHub when open
+		err = minion.SaveNewAppIncident(serviceName, endpointOrTopic, statusCode, traceID, appState, diagnosis)
 		if err != nil {
 			log.Printf("AppFixer save error: %v", err)
 			span.RecordError(err)
 		}
 
-		return // Halt for apps, no GitHub PRs for now
+		publishOpenAppIncident(ctx, alertName, serviceName, endpointOrTopic, statusCode, traceID, appState, diagnosis)
+		return // Halt for apps, no code PRs for now
 	}
 
 	if config.SoakDuration > 0 {
@@ -279,13 +311,15 @@ func processAlert(ctx context.Context, status, alertName string, labels, annotat
 		log.Printf("Error tracking cluster incident %s: %v", fingerprint, err)
 	}
 	if isDuplicate {
-		log.Printf("Duplicate alert %s detected (open in issue #%d). Incrementing count and skipping.", alertName, existingIssue)
-		span.AddEvent(fmt.Sprintf("Duplicate alert detected. Issue #%d already open.", existingIssue))
-		return
+		if existingIssue == 0 || incident.ReconcileClosedClusterIssue(ctx, fingerprint, existingIssue, github.IsIssueOpen) {
+			log.Printf("Duplicate alert %s detected (open in issue #%d). Incrementing count and skipping.", alertName, existingIssue)
+			span.AddEvent(fmt.Sprintf("Duplicate alert detected. Issue #%d already open.", existingIssue))
+			return
+		}
 	}
 
 	workloadBase := incident.NormalizeWorkloadBase(target)
-	if checkExistingOpenGitHubWork(fingerprint, alertName, namespace, target, workloadBase) {
+	if checkExistingOpenGitHubWork(ctx, fingerprint, alertName, namespace, target, workloadBase) {
 		span.AddEvent("Duplicate avoided via open GitHub Issue/PR lookup before triage.")
 		return
 	}
@@ -295,10 +329,13 @@ func processAlert(ctx context.Context, status, alertName string, labels, annotat
 	triageRes := minion.RunDiagnosticTriage(ctx, alertName, labels, annotations, telemetry)
 
 	if triageRes.Err != nil {
+		metrics.IncTriageVerdict("ERROR")
 		log.Printf("Diagnostic Triage failed for %s (%s/%s): %v. Halting safely without action.", alertName, namespace, target, triageRes.Err)
 		span.RecordError(triageRes.Err)
 		return
 	}
+
+	metrics.IncTriageVerdict(string(triageRes.Action))
 
 	if triageRes.Action == minion.ActionIgnore {
 		log.Printf("Diagnostic Triage ignored alert %s (confidence=%s). Halting.", alertName, triageRes.Confidence)
@@ -307,7 +344,7 @@ func processAlert(ctx context.Context, status, alertName string, labels, annotat
 		return
 	}
 
-	if checkExistingOpenGitHubWork(fingerprint, alertName, namespace, target, workloadBase) {
+	if checkExistingOpenGitHubWork(ctx, fingerprint, alertName, namespace, target, workloadBase) {
 		span.AddEvent("Duplicate avoided via open GitHub Issue/PR lookup before creating issue.")
 		return
 	}
@@ -322,7 +359,7 @@ func processAlert(ctx context.Context, status, alertName string, labels, annotat
 	issueBody := fmt.Sprintf("## Grafana Alert: %s\n\n**Verdict**: `%s` (Confidence: `%s`)\n\n%s\n\n<details>\n<summary>Collected Diagnostic Telemetry (Service + Helm)</summary>\n\n```text\n%s\n```\n</details>",
 		alertName, triageRes.Action, triageRes.Confidence, triageRes.Summary, telemetry)
 
-	issue, err := github.CreateIssue(issueTitle, issueBody, issueLabels)
+	issue, err := github.CreateIssue(ctx, issueTitle, issueBody, issueLabels)
 	if err != nil {
 		log.Printf("Error creating issue: %v", err)
 		span.RecordError(err)
@@ -334,7 +371,18 @@ func processAlert(ctx context.Context, status, alertName string, labels, annotat
 
 	if triageRes.Action == minion.ActionEscalateHuman {
 		log.Printf("Diagnostic Triage concluded ESCALATE_HUMAN (confidence=%s) for issue #%d. Skipping Fixer/PR.", triageRes.Confidence, issue.GetNumber())
-		_ = github.AssignIssueOrPR(issue.GetNumber(), config.GithubOwner)
+		_ = github.AssignIssueOrPR(ctx, issue.GetNumber(), config.GithubOwner)
+		return
+	}
+
+	if triageRes.Action == minion.ActionFixRuntime {
+		if triageRes.RuntimeAction == nil {
+			log.Printf("Diagnostic Triage returned FIX_RUNTIME without parsed RuntimeAction for issue #%d; escalating.", issue.GetNumber())
+			_ = github.AssignIssueOrPR(ctx, issue.GetNumber(), config.GithubOwner)
+			return
+		}
+		span.AddEvent("Executing Allowlisted Runtime Action")
+		_ = executeAndReportRuntimeFix(ctx, "reactive", fingerprint, issue.GetNumber(), *triageRes.RuntimeAction, triageRes.Summary)
 		return
 	}
 
@@ -347,27 +395,72 @@ func processAlert(ctx context.Context, status, alertName string, labels, annotat
 	}
 	state.StateMu.Unlock()
 
-	remediateClusterIssue(ctx, span, issue.GetNumber(), alertName, namespace, target, workloadBase, triageRes.Summary, telemetry)
+	_, _ = remediateClusterIssue(ctx, span, issue.GetNumber(), "reactive", alertName, namespace, target, workloadBase, triageRes.Summary, telemetry)
 }
 
-func checkExistingOpenGitHubWork(fingerprint, alertName, namespace, target, workloadBase string) bool {
-	if existingIssue, err := github.FindOpenIssueForTarget(namespace, target, workloadBase); err != nil {
+func publishOpenAppIncident(ctx context.Context, alertName, serviceName, endpointOrTopic, statusCode, traceID, stateVal, diagnosis string) {
+	if stateVal != "open" {
+		return
+	}
+
+	targetSvc := strings.TrimSpace(serviceName)
+	if targetSvc == "" {
+		targetSvc = "unknown-service"
+	}
+
+	if config.MemosDBDSN != "" {
+		note := db.FormatAppIncidentMemosNote(targetSvc, endpointOrTopic, statusCode, traceID, diagnosis)
+		if err := db.InsertMemosReport(ctx, config.MemosDBDSN, note, false); err != nil {
+			log.Printf("⚠️ Failed inserting app incident note into Memos: %v", err)
+		}
+	}
+
+	if github.Client == nil {
+		return
+	}
+
+	existing, err := github.FindOpenIssueForTarget(ctx, "apps", targetSvc, targetSvc)
+	if err != nil {
+		log.Printf("⚠️ Failed checking open GitHub issues for apps/%s: %v", targetSvc, err)
+	} else if existing != nil {
+		comment := fmt.Sprintf("🔁 Recurring open application error on `apps/%s` (endpoint=`%s`, status=`%s`, trace=`%s`).",
+			targetSvc, endpointOrTopic, statusCode, traceID)
+		_ = github.AddIssueComment(ctx, existing.GetNumber(), comment)
+		return
+	}
+
+	title := fmt.Sprintf("[App Alert] apps/%s: %s (%s)", targetSvc, endpointOrTopic, statusCode)
+	body := fmt.Sprintf("## Application Incident: %s\n\n- **Service**: `apps/%s`\n- **Endpoint / Topic**: `%s`\n- **Status Code**: `%s`\n- **Trace ID**: `%s`\n\n### Triage Diagnosis\n%s",
+		alertName, targetSvc, endpointOrTopic, statusCode, traceID, diagnosis)
+	labels := []string{"ai-incident", "app-incident", "needs-human-review"}
+	issue, createErr := github.CreateIssue(ctx, title, body, labels)
+	if createErr != nil {
+		log.Printf("⚠️ Failed creating app incident GitHub issue for apps/%s: %v", targetSvc, createErr)
+		return
+	}
+	if issue != nil {
+		_ = github.AssignIssueOrPR(ctx, issue.GetNumber(), config.GithubOwner)
+	}
+}
+
+func checkExistingOpenGitHubWork(ctx context.Context, fingerprint, alertName, namespace, target, workloadBase string) bool {
+	if existingIssue, err := github.FindOpenIssueForTarget(ctx, namespace, target, workloadBase); err != nil {
 		log.Printf("Error checking open GitHub issues for %s/%s: %v", namespace, target, err)
 	} else if existingIssue != nil {
 		log.Printf("Open GitHub issue #%d already tracks %s/%s (base=%s); suppressing duplicate issue for %s.",
 			existingIssue.GetNumber(), namespace, target, workloadBase, alertName)
-		_ = github.AddIssueComment(existingIssue.GetNumber(),
+		_ = github.AddIssueComment(ctx, existingIssue.GetNumber(),
 			fmt.Sprintf("🔁 Related alert `%s` (`%s/%s`) observed while this issue is open; suppressing duplicate issue/PR.", alertName, namespace, target))
 		_ = incident.RecordClusterIssue(fingerprint, alertName, namespace, target, existingIssue.GetNumber(), "firing")
 		return true
 	}
 
-	if existingPR, err := github.FindOpenPRForTarget(namespace, target, workloadBase); err != nil {
+	if existingPR, err := github.FindOpenPRForTarget(ctx, namespace, target, workloadBase); err != nil {
 		log.Printf("Error checking open GitHub PRs for %s/%s: %v", namespace, target, err)
 	} else if existingPR != nil {
 		log.Printf("Open GitHub fix PR #%d already addresses %s/%s (base=%s); suppressing duplicate issue/PR for %s.",
 			existingPR.GetNumber(), namespace, target, workloadBase, alertName)
-		_ = github.AddIssueComment(existingPR.GetNumber(),
+		_ = github.AddIssueComment(ctx, existingPR.GetNumber(),
 			fmt.Sprintf("🔁 Alert `%s` (`%s/%s`) fired while fix PR #%d is open awaiting merge; suppressing duplicate issue/PR.", alertName, namespace, target, existingPR.GetNumber()))
 		_ = incident.RecordClusterIssue(fingerprint, alertName, namespace, target, existingPR.GetNumber(), "firing")
 		return true
@@ -376,17 +469,33 @@ func checkExistingOpenGitHubWork(fingerprint, alertName, namespace, target, work
 	return false
 }
 
-func remediateClusterIssue(ctx context.Context, span trace.Span, issueNumber int, alertName, namespace, target, workloadBase, diagnosis, telemetry string) {
+func remediateClusterIssue(ctx context.Context, span trace.Span, issueNumber int, source, alertName, namespace, target, workloadBase, diagnosis, telemetry string) (string, int) {
 	workspace.Lock()
 	defer workspace.Unlock()
+
+	targetLabel := fmt.Sprintf("%s/%s", namespace, target)
+	emitReport := func(outcome, details string, prNum int) {
+		reportRemediationOutcome(ctx, RemediationReport{
+			Source:      source,
+			Mode:        "pr",
+			Target:      targetLabel,
+			Outcome:     outcome,
+			RootCause:   diagnosis,
+			Details:     details,
+			IssueNumber: issueNumber,
+			PRNumber:    prNum,
+		})
+	}
 
 	log.Printf("Created issue #%d. Creating branch...", issueNumber)
 	span.AddEvent("Resetting Workspace")
 	if err := workspace.ResetToMain(); err != nil {
 		log.Printf("Failed resetting workspace to main: %v", err)
 		span.RecordError(err)
-		_ = github.AssignIssueOrPR(issueNumber, config.GithubOwner)
-		return
+		metrics.IncRemediationOutcome("workspace_error")
+		_ = github.AssignIssueOrPR(ctx, issueNumber, config.GithubOwner)
+		emitReport("workspace_error", fmt.Sprintf("Failed resetting workspace to main: %v", err), 0)
+		return "workspace_error", 0
 	}
 
 	branchName := fmt.Sprintf("fix/alert-%d-%d", issueNumber, time.Now().Unix())
@@ -395,8 +504,10 @@ func remediateClusterIssue(ctx context.Context, span trace.Span, issueNumber int
 	if err := workspace.CreateAndCheckoutBranch(branchName); err != nil {
 		log.Printf("Failed to create branch: %v", err)
 		span.RecordError(err)
-		_ = github.AssignIssueOrPR(issueNumber, config.GithubOwner)
-		return
+		metrics.IncRemediationOutcome("workspace_error")
+		_ = github.AssignIssueOrPR(ctx, issueNumber, config.GithubOwner)
+		emitReport("workspace_error", fmt.Sprintf("Failed creating branch %s: %v", branchName, err), 0)
+		return "workspace_error", 0
 	}
 
 	var reviewFeedback string
@@ -408,13 +519,26 @@ func remediateClusterIssue(ctx context.Context, span trace.Span, issueNumber int
 		span.AddEvent(fmt.Sprintf("Running Fixer Minion (Attempt %d)", attempt))
 
 		fixerLogs := minion.RunFixer(ctx, issueNumber, branchName, alertName, diagnosis, telemetry, reviewFeedback)
-		_ = github.AddIssueComment(issueNumber, fmt.Sprintf("Attempt %d:\n%s", attempt, fixerLogs))
+		_ = github.AddIssueComment(ctx, issueNumber, fmt.Sprintf("Attempt %d:\n%s", attempt, fixerLogs))
 
 		span.AddEvent("Fetching Local Diff")
 		localDiff, err := workspace.GetLocalDiff("main")
 		if err != nil {
 			log.Printf("Failed to get local diff: %v", err)
-			break
+			metrics.IncRemediationOutcome("error")
+			_ = github.AssignIssueOrPR(ctx, issueNumber, config.GithubOwner)
+			emitReport("error", fmt.Sprintf("Failed reading local diff: %v", err), prNumber)
+			return "error", prNumber
+		}
+		if strings.TrimSpace(localDiff) == "" {
+			log.Printf("Fixer produced empty diff on branch %s (Attempt %d). Retrying Fixer...", branchName, attempt)
+			reviewFeedback = "Your previous attempt produced no git diff against main. Apply the minimal declarative change, commit, and push to the branch."
+			continue
+		}
+		if pushErr := workspace.VerifyBranchPushed(branchName); pushErr != nil {
+			log.Printf("Branch %s push verification failed (Attempt %d): %v. Retrying Fixer...", branchName, attempt, pushErr)
+			reviewFeedback = fmt.Sprintf("Workspace verification failed before PR review: %v. Ensure all changes are committed and pushed cleanly to branch %s.", pushErr, branchName)
+			continue
 		}
 
 		log.Printf("Triggering Senior Fixer Minion...")
@@ -434,10 +558,13 @@ func remediateClusterIssue(ctx context.Context, span trace.Span, issueNumber int
 			prTitle := fmt.Sprintf("Fix for %s: %s/%s (Issue #%d)", alertName, namespace, target, issueNumber)
 			prBody := fmt.Sprintf("Automated PR by AI Fixer Minion.\n\n**Namespace**: %s\n**Target**: %s\n**Workload**: %s\n\nCloses #%d", namespace, target, workloadBase, issueNumber)
 
-			pr, err := github.CreatePullRequest(branchName, prTitle, prBody)
+			pr, err := github.CreatePullRequest(ctx, branchName, prTitle, prBody)
 			if err != nil {
 				log.Printf("Error creating PR: %v", err)
-				break
+				metrics.IncRemediationOutcome("error")
+				_ = github.AssignIssueOrPR(ctx, issueNumber, config.GithubOwner)
+				emitReport("error", fmt.Sprintf("Failed creating PR on branch %s: %v", branchName, err), 0)
+				return "error", 0
 			}
 			prCreated = true
 			prNumber = pr.GetNumber()
@@ -445,10 +572,14 @@ func remediateClusterIssue(ctx context.Context, span trace.Span, issueNumber int
 		}
 
 		log.Printf("Fetching PR Diff for #%d...", prNumber)
-		diff, err := github.GetPullRequestDiff(prNumber)
+		diff, err := github.GetPullRequestDiff(ctx, prNumber)
 		if err != nil {
 			log.Printf("Error fetching PR diff for #%d: %v", prNumber, err)
-			break
+			metrics.IncRemediationOutcome("error")
+			_ = github.AssignIssueOrPR(ctx, prNumber, config.GithubOwner)
+			_ = github.AssignIssueOrPR(ctx, issueNumber, config.GithubOwner)
+			emitReport("error", fmt.Sprintf("Failed fetching PR #%d diff: %v", prNumber, err), prNumber)
+			return "error", prNumber
 		}
 
 		log.Printf("Triggering Reviewer Minion for PR #%d...", prNumber)
@@ -459,44 +590,55 @@ func remediateClusterIssue(ctx context.Context, span trace.Span, issueNumber int
 			ciPassed, ciSummary, ciErr := github.WaitForPRChecks(ctx, prNumber, 15*time.Second, 5*time.Minute)
 			if ciErr != nil {
 				log.Printf("Timed out or failed polling CI checks for PR #%d: %v", prNumber, ciErr)
-				_ = github.AddIssueComment(prNumber, fmt.Sprintf("⚠️ **Reviewer Approved**, but waiting for CI checks failed (%v). Please verify CI and merge manually.", ciErr))
-				_ = github.AssignIssueOrPR(prNumber, config.GithubOwner)
-				return
+				metrics.IncRemediationOutcome("ci_timeout")
+				_ = github.AddIssueComment(ctx, prNumber, fmt.Sprintf("⚠️ **Reviewer Approved**, but waiting for CI checks failed (%v). Please verify CI and merge manually.", ciErr))
+				_ = github.AssignIssueOrPR(ctx, prNumber, config.GithubOwner)
+				emitReport("ci_timeout", fmt.Sprintf("Reviewer approved PR #%d, but CI check polling failed: %v", prNumber, ciErr), prNumber)
+				return "ci_timeout", prNumber
 			}
 			if !ciPassed {
 				log.Printf("CI checks failed on PR #%d (%s). Feeding back to Fixer...", prNumber, ciSummary)
 				reviewFeedback = ciSummary
-				_ = github.AddIssueComment(prNumber, fmt.Sprintf("⚠️ **Reviewer Approved**, but CI checks failed:\n\n```text\n%s\n```\nRetrying Fixer...", ciSummary))
+				_ = github.AddIssueComment(ctx, prNumber, fmt.Sprintf("⚠️ **Reviewer Approved**, but CI checks failed:\n\n```text\n%s\n```\nRetrying Fixer...", ciSummary))
 				continue
 			}
 
 			if !config.AutoMerge {
 				log.Printf("PR #%d Approved & CI Passed (%s); assigning human for merge (AUTO_MERGE=false).", prNumber, ciSummary)
-				_ = github.AddIssueComment(prNumber, fmt.Sprintf("✅ **Diagnostic, Reviewer & CI Passed** (%s): Ready for human merge (`AUTO_MERGE=false`).", ciSummary))
-				_ = github.AssignIssueOrPR(prNumber, config.GithubOwner)
-				return
+				metrics.IncRemediationOutcome("ready_for_human_merge")
+				_ = github.AddIssueComment(ctx, prNumber, fmt.Sprintf("✅ **Diagnostic, Reviewer & CI Passed** (%s): Ready for human merge (`AUTO_MERGE=false`).", ciSummary))
+				_ = github.AssignIssueOrPR(ctx, prNumber, config.GithubOwner)
+				emitReport("ready_for_human_merge", fmt.Sprintf("PR #%d approved by Reviewer and CI (%s); awaiting human merge (AUTO_MERGE=false).", prNumber, ciSummary), prNumber)
+				return "ready_for_human_merge", prNumber
 			}
 
 			log.Printf("PR #%d Approved & CI Passed (%s)! Merging...", prNumber, ciSummary)
-			if mergeErr := github.MergePullRequest(prNumber); mergeErr != nil {
+			if mergeErr := github.MergePullRequest(ctx, prNumber); mergeErr != nil {
 				log.Printf("Failed to auto-merge PR #%d: %v", prNumber, mergeErr)
-				_ = github.AddIssueComment(prNumber, fmt.Sprintf("⚠️ **Reviewer & CI Approved**, but auto-merge failed: %v. Please merge manually.", mergeErr))
-				_ = github.AssignIssueOrPR(prNumber, config.GithubOwner)
-			} else {
-				_ = github.AddIssueComment(prNumber, fmt.Sprintf("✅ **Reviewer Minion & CI Approved** (%s): The diff looks good and CI passed. Merged automatically.", ciSummary))
+				metrics.IncRemediationOutcome("error")
+				_ = github.AddIssueComment(ctx, prNumber, fmt.Sprintf("⚠️ **Reviewer & CI Approved**, but auto-merge failed: %v. Please merge manually.", mergeErr))
+				_ = github.AssignIssueOrPR(ctx, prNumber, config.GithubOwner)
+				emitReport("error", fmt.Sprintf("Reviewer and CI passed on PR #%d, but auto-merge failed: %v", prNumber, mergeErr), prNumber)
+				return "error", prNumber
 			}
-			return
+			metrics.IncRemediationOutcome("merged")
+			_ = github.AddIssueComment(ctx, prNumber, fmt.Sprintf("✅ **Reviewer Minion & CI Approved** (%s): The diff looks good and CI passed. Merged automatically.", ciSummary))
+			emitReport("merged", fmt.Sprintf("PR #%d approved by Reviewer and CI (%s) and merged automatically.", prNumber, ciSummary), prNumber)
+			return "merged", prNumber
 		} else {
 			log.Printf("PR #%d Rejected. Feeding back to Fixer...", prNumber)
 			reviewFeedback = reviewComments
-			_ = github.AddIssueComment(prNumber, fmt.Sprintf("❌ **Reviewer Minion Rejected**: Attempting to fix again.\n\n```text\n%s\n```", reviewComments))
+			_ = github.AddIssueComment(ctx, prNumber, fmt.Sprintf("❌ **Reviewer Minion Rejected**: Attempting to fix again.\n\n```text\n%s\n```", reviewComments))
 		}
 	}
 
 	log.Printf("Exhausted automated fix attempts. Assigning human...")
+	metrics.IncRemediationOutcome("exhausted")
 	if prCreated {
-		_ = github.AddIssueComment(prNumber, "❌ **AI Automation Exhausted**: Maximum retry attempts reached. Assigning a human.")
-		_ = github.AssignIssueOrPR(prNumber, config.GithubOwner)
+		_ = github.AddIssueComment(ctx, prNumber, "❌ **AI Automation Exhausted**: Maximum retry attempts reached. Assigning a human.")
+		_ = github.AssignIssueOrPR(ctx, prNumber, config.GithubOwner)
 	}
-	_ = github.AssignIssueOrPR(issueNumber, config.GithubOwner)
+	_ = github.AssignIssueOrPR(ctx, issueNumber, config.GithubOwner)
+	emitReport("exhausted", fmt.Sprintf("Automated PR attempts exhausted for branch %s.", branchName), prNumber)
+	return "exhausted", prNumber
 }

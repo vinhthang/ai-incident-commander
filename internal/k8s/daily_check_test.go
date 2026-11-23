@@ -2,6 +2,7 @@ package k8s
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestCollectDailyFleetSnapshot_FlagsUnhealthyPodsAndEmptyEndpoints(t *testing.T) {
@@ -100,6 +102,74 @@ echo "1 chart(s) linted, 0 chart(s) failed"
 	} {
 		if !strings.Contains(snapshot, want) {
 			t.Errorf("expected daily snapshot to contain %q, got:\n%s", want, snapshot)
+		}
+	}
+}
+
+func TestCollectDailyFleetSnapshot_IgnoresSelfTriggerSupersededCronJobsAndOldRestarts(t *testing.T) {
+	binDir := t.TempDir()
+	now := time.Now().UTC()
+	oldTS := now.Add(-480 * time.Hour).Format(time.RFC3339)
+	recentTS := now.Add(-2 * time.Hour).Format(time.RFC3339)
+
+	podsJSON := fmt.Sprintf(`{"items":[
+		{"metadata":{"namespace":"system","name":"ai-commander-daily-report-29921775-rlzr5","labels":{"app":"ai-commander-daily-report","job-name":"ai-commander-daily-report-29921775"}},"status":{"phase":"Running","containerStatuses":[{"name":"trigger","ready":false,"restartCount":0}]}},
+		{"metadata":{"namespace":"data","name":"postgres-primary-0"},"status":{"phase":"Running","containerStatuses":[{"name":"postgres","ready":true,"restartCount":1,"lastState":{"terminated":{"finishedAt":%q}},"state":{"running":{"startedAt":%q}}}]}},
+		{"metadata":{"namespace":"apps","name":"recent-crash-0"},"status":{"phase":"Running","containerStatuses":[{"name":"app","ready":true,"restartCount":2,"lastState":{"terminated":{"finishedAt":%q}},"state":{"running":{"startedAt":%q}}}]}}
+	]}`, oldTS, oldTS, recentTS, recentTS)
+
+	jobsJSON := `{"items":[
+		{"metadata":{"namespace":"system","name":"ai-commander-daily-report-29918895","creationTimestamp":"2026-11-20T00:15:00Z","ownerReferences":[{"kind":"CronJob","name":"ai-commander-daily-report"}]},"status":{"failed":1}},
+		{"metadata":{"namespace":"system","name":"ai-commander-daily-report-29921775","creationTimestamp":"2026-11-22T00:15:00Z","ownerReferences":[{"kind":"CronJob","name":"ai-commander-daily-report"}]},"status":{"failed":0}},
+		{"metadata":{"namespace":"system","name":"broken-cron-100","creationTimestamp":"2026-11-21T01:00:00Z","ownerReferences":[{"kind":"CronJob","name":"broken-cron"}]},"status":{"failed":0}},
+		{"metadata":{"namespace":"system","name":"broken-cron-200","creationTimestamp":"2026-11-22T01:00:00Z","ownerReferences":[{"kind":"CronJob","name":"broken-cron"}]},"status":{"failed":1}},
+		{"metadata":{"namespace":"apps","name":"db-migrate","creationTimestamp":"2026-11-22T02:00:00Z"},"status":{"failed":1}}
+	]}`
+
+	kubectlScript := fmt.Sprintf(`#!/bin/sh
+case "$*" in
+  *"get nodes"*) echo '{"items":[]}' ;;
+  *"get pods -A"*) cat <<'EOF'
+%s
+EOF
+    ;;
+  *"get deployments,statefulsets -A"*) echo '{"items":[]}' ;;
+  *"get svc -A"*) echo '{"items":[]}' ;;
+  *"get endpoints -A"*) echo '{"items":[]}' ;;
+  *"get jobs"*) cat <<'EOF'
+%s
+EOF
+    ;;
+  *"get pvc"*) echo '{"items":[]}' ;;
+  *"get events -A"*) echo "" ;;
+esac
+`, podsJSON, jobsJSON)
+
+	if err := os.WriteFile(filepath.Join(binDir, "kubectl"), []byte(kubectlScript), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	snapshot := CollectDailyFleetSnapshot(context.Background(), "", "")
+
+	for _, forbidden := range []string{
+		"ai-commander-daily-report-29921775-rlzr5",
+		"postgres-primary-0",
+		"ai-commander-daily-report-29918895",
+	} {
+		if strings.Contains(snapshot, forbidden) {
+			t.Errorf("expected daily snapshot to ignore %q, got:\n%s", forbidden, snapshot)
+		}
+	}
+
+	for _, want := range []string{
+		"Healthy Running Pods: 1",
+		"apps/recent-crash-0",
+		"system/broken-cron-200",
+		"apps/db-migrate",
+	} {
+		if !strings.Contains(snapshot, want) {
+			t.Errorf("expected daily snapshot to retain %q, got:\n%s", want, snapshot)
 		}
 	}
 }

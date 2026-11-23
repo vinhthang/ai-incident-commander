@@ -10,9 +10,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"go.opentelemetry.io/otel/attribute"
 	"vinhthang.dev/ai-incident-commander/internal/config"
+	"vinhthang.dev/ai-incident-commander/internal/metrics"
 )
 
 type AgyJob struct {
@@ -30,9 +32,14 @@ type AgyResult struct {
 // AgyQueue holds pending AGY executions (buffered up to 100).
 var AgyQueue = make(chan AgyJob, 100)
 
+func init() {
+	metrics.SetQueueDepthFunc(func() int { return len(AgyQueue) })
+}
+
 // StartAgyWorker launches the single background worker that processes AGY executions.
 // This guarantees that only one AGY process runs at a time across the entire application.
 func StartAgyWorker() {
+	metrics.SetQueueDepthFunc(func() int { return len(AgyQueue) })
 	go func() {
 		log.Println("🚀 Starting background AGY Worker Queue (Concurrency: 1)")
 		for job := range AgyQueue {
@@ -94,8 +101,21 @@ func syncAgyRuntimeDir(hostAuthDir, runtimeGeminiDir string) error {
 }
 
 func executeAgy(job AgyJob) {
-	_, span := tracer.Start(job.Ctx, "executeAgyQueueJob")
+	jobCtx := job.Ctx
+	if jobCtx == nil {
+		jobCtx = context.Background()
+	}
+
+	_, span := tracer.Start(jobCtx, "executeAgyQueueJob")
 	defer span.End()
+
+	if err := jobCtx.Err(); err != nil {
+		span.RecordError(err)
+		span.AddEvent("Skipped expired/cancelled AGY job before execution")
+		metrics.IncAgyJob("skipped_expired")
+		job.Result <- AgyResult{Err: err}
+		return
+	}
 
 	if config.AgyHostAuthDir != "" {
 		if homeDir, err := os.UserHomeDir(); err == nil && homeDir != "" {
@@ -109,18 +129,23 @@ func executeAgy(job AgyJob) {
 	span.AddEvent("Starting isolated AGY process")
 
 	args := buildAgyArgs(job.Prompt, config.AgyModel)
-	cmd := exec.CommandContext(job.Ctx, "/usr/local/bin/agy", args...)
+	cmd := exec.CommandContext(jobCtx, "/usr/local/bin/agy", args...)
 	cmd.Dir = config.WorkspaceDir
 
 	var outBuf, errBuf bytes.Buffer
 	cmd.Stdout = io.MultiWriter(os.Stdout, &outBuf)
 	cmd.Stderr = io.MultiWriter(os.Stderr, &errBuf)
 
+	started := time.Now()
 	err := cmd.Run()
+	metrics.ObserveAgyDuration(time.Since(started).Seconds())
 
 	if err != nil {
 		span.RecordError(err)
 		span.SetAttributes(attribute.Bool("error", true))
+		metrics.IncAgyJob("error")
+	} else {
+		metrics.IncAgyJob("success")
 	}
 
 	span.AddEvent("AGY process completed")
@@ -133,9 +158,16 @@ func executeAgy(job AgyJob) {
 	}
 }
 
-// EnqueueAgyJob is a helper method used by minion functions to submit a prompt to the worker queue
-// and block until the execution is finished.
+// EnqueueAgyJob submits a prompt to the serialized worker queue and respects ctx cancellation
+// while waiting for admission or completion.
 func EnqueueAgyJob(ctx context.Context, prompt string) AgyResult {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return AgyResult{Err: err}
+	}
+
 	resultChan := make(chan AgyResult, 1)
 	job := AgyJob{
 		Ctx:    ctx,
@@ -143,9 +175,16 @@ func EnqueueAgyJob(ctx context.Context, prompt string) AgyResult {
 		Result: resultChan,
 	}
 
-	// Push to global channel
-	AgyQueue <- job
+	select {
+	case AgyQueue <- job:
+	case <-ctx.Done():
+		return AgyResult{Err: ctx.Err()}
+	}
 
-	// Wait for the worker to finish and return
-	return <-resultChan
+	select {
+	case res := <-resultChan:
+		return res
+	case <-ctx.Done():
+		return AgyResult{Err: ctx.Err()}
+	}
 }

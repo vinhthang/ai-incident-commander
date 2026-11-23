@@ -48,6 +48,11 @@ Structure your concise Markdown report as:
 ### Actionable Recommendations
 (Concrete next steps if any issue was observed, or "No operator action required." if healthy)
 
+(Optional — ONLY for verified `HIGH`-confidence root causes in the snapshot above, emit up to 3 machine-readable dispatch lines BEFORE the final HEALTH_STATUS line. Go will deduplicate against open GitHub Issues/PRs and execute them after publishing this report. NEVER emit PROACTIVE_ACTION for `kube-system`, `data`, core stateful DBs, or `system/ai-incident-commander`:)
+PROACTIVE_ACTION: FIX_VIA_PR | <namespace>/<target> | <verified root cause and minimal Helm/Caddy fix>
+PROACTIVE_ACTION: FIX_RUNTIME | ROLLOUT_RESTART <namespace>/<deployment|statefulset>/<name> | <verified root cause>
+PROACTIVE_ACTION: FIX_RUNTIME | DELETE_FAILED_JOB <namespace>/job/<name> | <verified root cause>
+
 On the very last line, output EXACTLY one of:
 HEALTH_STATUS: HEALTHY
 HEALTH_STATUS: ATTENTION_NEEDED

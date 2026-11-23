@@ -258,7 +258,7 @@ func TestFindOpenIssueForTarget(t *testing.T) {
 	baseURL, _ := url.Parse(srv.URL + "/")
 	Client.BaseURL = baseURL
 
-	found, err := FindOpenIssueForTarget("system", "ai-commander-daily-report-29918895", "ai-commander-daily-report")
+	found, err := FindOpenIssueForTarget(context.Background(), "system", "ai-commander-daily-report-29918895", "ai-commander-daily-report")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -266,7 +266,7 @@ func TestFindOpenIssueForTarget(t *testing.T) {
 		t.Fatalf("expected open issue #335 matching workload base, got %+v", found)
 	}
 
-	none, err := FindOpenIssueForTarget("apps", "vietcalendar", "vietcalendar")
+	none, err := FindOpenIssueForTarget(context.Background(), "apps", "vietcalendar", "vietcalendar")
 	if err != nil {
 		t.Fatalf("unexpected error for unmatched target: %v", err)
 	}
@@ -314,7 +314,7 @@ func TestFindOpenPRForTarget(t *testing.T) {
 	baseURL, _ := url.Parse(srv.URL + "/")
 	Client.BaseURL = baseURL
 
-	pr, err := FindOpenPRForTarget("system", "ai-commander-daily-report-29918895", "ai-commander-daily-report")
+	pr, err := FindOpenPRForTarget(context.Background(), "system", "ai-commander-daily-report-29918895", "ai-commander-daily-report")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -322,11 +322,110 @@ func TestFindOpenPRForTarget(t *testing.T) {
 		t.Fatalf("expected open fix PR #336 matching workload base, got %+v", pr)
 	}
 
-	none, err := FindOpenPRForTarget("apps", "vietcalendar", "vietcalendar")
+	none, err := FindOpenPRForTarget(context.Background(), "apps", "vietcalendar", "vietcalendar")
 	if err != nil {
 		t.Fatalf("unexpected error for unmatched target: %v", err)
 	}
 	if none != nil {
 		t.Fatalf("expected nil for unmatched target, got PR #%d", none.GetNumber())
+	}
+}
+
+func TestGetPullRequestDiff_ChecksStatusCodeAndRespectsContext(t *testing.T) {
+	origBase := APIBaseURL
+	origOwner := config.GithubOwner
+	origRepo := config.GithubRepo
+	origToken := config.GithubToken
+	defer func() {
+		APIBaseURL = origBase
+		config.GithubOwner = origOwner
+		config.GithubRepo = origRepo
+		config.GithubToken = origToken
+	}()
+	config.GithubOwner = "vinhthang"
+	config.GithubRepo = "oci"
+	config.GithubToken = "ghp-test-secret"
+
+	var seenAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenAuth = r.Header.Get("Authorization")
+		switch r.URL.Path {
+		case "/repos/vinhthang/oci/pulls/10":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("diff --git a/a.yaml b/a.yaml\n"))
+		case "/repos/vinhthang/oci/pulls/404":
+			http.Error(w, `{"message":"Not Found"}`, http.StatusNotFound)
+		default:
+			http.Error(w, "forbidden", http.StatusForbidden)
+		}
+	}))
+	defer srv.Close()
+	APIBaseURL = srv.URL
+
+	diff, err := GetPullRequestDiff(context.Background(), 10)
+	if err != nil || !strings.Contains(diff, "diff --git") {
+		t.Fatalf("expected valid diff on 200 OK, got err=%v diff=%q", err, diff)
+	}
+	if seenAuth != "Bearer ghp-test-secret" {
+		t.Fatalf("expected Authorization Bearer header, got %q", seenAuth)
+	}
+
+	if badDiff, err := GetPullRequestDiff(context.Background(), 404); err == nil {
+		t.Fatalf("expected error on 404 status, got nil error and diff=%q", badDiff)
+	}
+
+	cancelledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := GetPullRequestDiff(cancelledCtx, 10); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled on cancelled ctx, got %v", err)
+	}
+}
+
+func TestIsIssueOpen(t *testing.T) {
+	origClient := Client
+	origOwner := config.GithubOwner
+	origRepo := config.GithubRepo
+	defer func() {
+		Client = origClient
+		config.GithubOwner = origOwner
+		config.GithubRepo = origRepo
+	}()
+	config.GithubOwner = "vinhthang"
+	config.GithubRepo = "oci"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/repos/vinhthang/oci/issues/339":
+			_ = json.NewEncoder(w).Encode(map[string]any{"number": 339, "state": "closed"})
+		case "/repos/vinhthang/oci/issues/344":
+			_ = json.NewEncoder(w).Encode(map[string]any{"number": 344, "state": "open"})
+		default:
+			http.Error(w, "upstream error", http.StatusInternalServerError)
+		}
+	}))
+	defer srv.Close()
+
+	Client = gh.NewClient(srv.Client())
+	baseURL, _ := url.Parse(srv.URL + "/")
+	Client.BaseURL = baseURL
+
+	openClosed, err := IsIssueOpen(context.Background(), 339)
+	if err != nil || openClosed {
+		t.Fatalf("expected closed issue #339 => (false, nil), got (%v, %v)", openClosed, err)
+	}
+	openLive, err := IsIssueOpen(context.Background(), 344)
+	if err != nil || !openLive {
+		t.Fatalf("expected open issue #344 => (true, nil), got (%v, %v)", openLive, err)
+	}
+	if _, err := IsIssueOpen(context.Background(), 500); err == nil {
+		t.Fatalf("expected error on 500 API failure")
+	}
+	if openZero, err := IsIssueOpen(context.Background(), 0); err != nil || openZero {
+		t.Fatalf("expected issueNumber<=0 => (false, nil), got (%v, %v)", openZero, err)
+	}
+	Client = nil
+	if openNilClient, err := IsIssueOpen(context.Background(), 344); err != nil || openNilClient {
+		t.Fatalf("expected nil Client => (false, nil), got (%v, %v)", openNilClient, err)
 	}
 }

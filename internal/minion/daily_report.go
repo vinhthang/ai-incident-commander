@@ -8,8 +8,104 @@ import (
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
+	"vinhthang.dev/ai-incident-commander/internal/k8s"
 	"vinhthang.dev/ai-incident-commander/internal/prompt"
 )
+
+// ProactiveActionMode identifies the execution path for a proactive daily-audit finding.
+type ProactiveActionMode string
+
+const (
+	ProactiveFixViaPR   ProactiveActionMode = "FIX_VIA_PR"
+	ProactiveFixRuntime ProactiveActionMode = "FIX_RUNTIME"
+)
+
+// DailyProactiveAction represents a validated proactive fix candidate emitted by the daily fleet audit.
+type DailyProactiveAction struct {
+	Mode          ProactiveActionMode
+	Namespace     string
+	Target        string
+	Diagnosis     string
+	RuntimeAction *k8s.RuntimeAction
+}
+
+// ParseDailyProactiveActions extracts valid PROACTIVE_ACTION lines and returns a cleaned report.
+func ParseDailyProactiveActions(output string) (string, []DailyProactiveAction) {
+	lines := strings.Split(output, "\n")
+	kept := make([]string, 0, len(lines))
+	actions := make([]DailyProactiveAction, 0)
+	seen := make(map[string]struct{})
+
+	for _, line := range lines {
+		stripped := strings.NewReplacer("`", "", "*", "").Replace(strings.TrimSpace(line))
+		stripped = strings.TrimSpace(strings.TrimLeft(stripped, "- "))
+		if len(stripped) >= len("PROACTIVE_ACTION:") && strings.EqualFold(stripped[:len("PROACTIVE_ACTION:")], "PROACTIVE_ACTION:") {
+			payload := strings.TrimSpace(stripped[len("PROACTIVE_ACTION:"):])
+			if act, key, ok := parseProactiveActionPayload(payload); ok {
+				if _, exists := seen[key]; !exists {
+					seen[key] = struct{}{}
+					actions = append(actions, act)
+				}
+			}
+			continue
+		}
+		kept = append(kept, line)
+	}
+
+	return strings.TrimSpace(strings.Join(kept, "\n")), actions
+}
+
+func parseProactiveActionPayload(payload string) (DailyProactiveAction, string, bool) {
+	parts := strings.SplitN(payload, "|", 3)
+	if len(parts) != 3 {
+		return DailyProactiveAction{}, "", false
+	}
+
+	modeStr := strings.ToUpper(strings.TrimSpace(parts[0]))
+	targetSpec := strings.TrimSpace(parts[1])
+	diagnosis := strings.TrimSpace(parts[2])
+	if diagnosis == "" {
+		return DailyProactiveAction{}, "", false
+	}
+
+	switch ProactiveActionMode(modeStr) {
+	case ProactiveFixViaPR:
+		slashParts := strings.Split(targetSpec, "/")
+		if len(slashParts) != 2 {
+			return DailyProactiveAction{}, "", false
+		}
+		ns := strings.TrimSpace(slashParts[0])
+		target := strings.TrimSpace(slashParts[1])
+		if ns == "" || target == "" || strings.ContainsAny(ns+target, " \t") {
+			return DailyProactiveAction{}, "", false
+		}
+		key := "pr:" + ns + "/" + target
+		return DailyProactiveAction{
+			Mode:      ProactiveFixViaPR,
+			Namespace: ns,
+			Target:    target,
+			Diagnosis: diagnosis,
+		}, key, true
+
+	case ProactiveFixRuntime:
+		rtAct, err := k8s.ParseRuntimeActionSpec(targetSpec)
+		if err != nil {
+			return DailyProactiveAction{}, "", false
+		}
+		rtAct.Reason = diagnosis
+		key := "runtime:" + rtAct.TargetString()
+		return DailyProactiveAction{
+			Mode:          ProactiveFixRuntime,
+			Namespace:     rtAct.Namespace,
+			Target:        rtAct.Name,
+			Diagnosis:     diagnosis,
+			RuntimeAction: &rtAct,
+		}, key, true
+
+	default:
+		return DailyProactiveAction{}, "", false
+	}
+}
 
 // ParseDailyHealthStatus parses the final HEALTH_STATUS line from the daily audit output.
 // Unrecognized or incomplete reports default conservatively to ATTENTION_NEEDED.

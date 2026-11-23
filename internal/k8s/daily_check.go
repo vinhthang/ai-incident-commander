@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -95,6 +96,10 @@ func collectNodesSnapshot(ctx context.Context, b *strings.Builder) {
 }
 
 func collectPodsSnapshot(ctx context.Context, b *strings.Builder) {
+	collectPodsSnapshotAt(ctx, b, time.Now().UTC())
+}
+
+func collectPodsSnapshotAt(ctx context.Context, b *strings.Builder, now time.Time) {
 	out, err := runCmd(ctx, "", "kubectl", "get", "pods", "-A", "-o", "json")
 	if err != nil {
 		return
@@ -102,8 +107,9 @@ func collectPodsSnapshot(ctx context.Context, b *strings.Builder) {
 	var list struct {
 		Items []struct {
 			Metadata struct {
-				Namespace string `json:"namespace"`
-				Name      string `json:"name"`
+				Namespace string            `json:"namespace"`
+				Name      string            `json:"name"`
+				Labels    map[string]string `json:"labels"`
 			} `json:"metadata"`
 			Status struct {
 				Phase             string `json:"phase"`
@@ -115,7 +121,15 @@ func collectPodsSnapshot(ctx context.Context, b *strings.Builder) {
 						Waiting *struct {
 							Reason string `json:"reason"`
 						} `json:"waiting"`
+						Running *struct {
+							StartedAt string `json:"startedAt"`
+						} `json:"running"`
 					} `json:"state"`
+					LastState struct {
+						Terminated *struct {
+							FinishedAt string `json:"finishedAt"`
+						} `json:"terminated"`
+					} `json:"lastState"`
 				} `json:"containerStatuses"`
 			} `json:"status"`
 		} `json:"items"`
@@ -124,25 +138,37 @@ func collectPodsSnapshot(ctx context.Context, b *strings.Builder) {
 		return
 	}
 
+	cutoff := now.Add(-24 * time.Hour)
 	healthy := 0
 	var issues []string
 	for _, p := range list.Items {
-		if p.Status.Phase == "Succeeded" {
+		if p.Status.Phase == "Succeeded" || isSelfTriggerPod(p.Metadata.Labels) {
 			continue
 		}
-		unhealthyReasons := []string{}
-		totalRestarts := 0
+		var unhealthyReasons []string
+		recentRestarts := 0
 		for _, cs := range p.Status.ContainerStatuses {
-			totalRestarts += cs.RestartCount
+			if cs.RestartCount > 0 {
+				var finishedAt, startedAt string
+				if cs.LastState.Terminated != nil {
+					finishedAt = cs.LastState.Terminated.FinishedAt
+				}
+				if cs.State.Running != nil {
+					startedAt = cs.State.Running.StartedAt
+				}
+				if isRecentRestart(finishedAt, startedAt, cutoff) {
+					recentRestarts += cs.RestartCount
+				}
+			}
 			if cs.State.Waiting != nil && cs.State.Waiting.Reason != "" {
 				unhealthyReasons = append(unhealthyReasons, cs.State.Waiting.Reason)
 			} else if !cs.Ready {
 				unhealthyReasons = append(unhealthyReasons, cs.Name+"=NotReady")
 			}
 		}
-		if p.Status.Phase != "Running" || len(unhealthyReasons) > 0 || totalRestarts > 0 {
+		if p.Status.Phase != "Running" || len(unhealthyReasons) > 0 || recentRestarts > 0 {
 			issues = append(issues, fmt.Sprintf("- %s/%s: phase=%s restarts=%d issues=%v",
-				p.Metadata.Namespace, p.Metadata.Name, p.Status.Phase, totalRestarts, unhealthyReasons))
+				p.Metadata.Namespace, p.Metadata.Name, p.Status.Phase, recentRestarts, unhealthyReasons))
 		} else {
 			healthy++
 		}
@@ -158,6 +184,29 @@ func collectPodsSnapshot(ctx context.Context, b *strings.Builder) {
 		b.WriteString(line + "\n")
 	}
 	b.WriteString("\n")
+}
+
+func isSelfTriggerPod(labels map[string]string) bool {
+	if labels == nil {
+		return false
+	}
+	if labels["app"] == "ai-commander-daily-report" {
+		return true
+	}
+	return strings.HasPrefix(labels["job-name"], "ai-commander-daily-report-")
+}
+
+func isRecentRestart(finishedAt, startedAt string, cutoff time.Time) bool {
+	for _, raw := range []string{finishedAt, startedAt} {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		if ts, err := time.Parse(time.RFC3339, raw); err == nil {
+			return !ts.Before(cutoff)
+		}
+	}
+	return true
 }
 
 func collectWorkloadsSnapshot(ctx context.Context, b *strings.Builder) {
@@ -277,8 +326,13 @@ func collectJobsAndPVCsSnapshot(ctx context.Context, b *strings.Builder) {
 		var jobs struct {
 			Items []struct {
 				Metadata struct {
-					Namespace string `json:"namespace"`
-					Name      string `json:"name"`
+					Namespace         string `json:"namespace"`
+					Name              string `json:"name"`
+					CreationTimestamp string `json:"creationTimestamp"`
+					OwnerReferences   []struct {
+						Kind string `json:"kind"`
+						Name string `json:"name"`
+					} `json:"ownerReferences"`
 				} `json:"metadata"`
 				Status struct {
 					Failed int32 `json:"failed"`
@@ -286,11 +340,45 @@ func collectJobsAndPVCsSnapshot(ctx context.Context, b *strings.Builder) {
 			} `json:"items"`
 		}
 		if json.Unmarshal([]byte(jobOut), &jobs) == nil {
+			type jobEntry struct {
+				key       string
+				createdAt time.Time
+				failed    int32
+			}
+			cronLatest := make(map[string]jobEntry)
+			var failedJobs []jobEntry
+
 			for _, j := range jobs.Items {
-				if j.Status.Failed > 0 {
-					foundIssue = true
-					fmt.Fprintf(b, "- Job %s/%s: failed=%d\n", j.Metadata.Namespace, j.Metadata.Name, j.Status.Failed)
+				key := j.Metadata.Namespace + "/" + j.Metadata.Name
+				createdAt, _ := time.Parse(time.RFC3339, strings.TrimSpace(j.Metadata.CreationTimestamp))
+				cronOwner := ""
+				for _, owner := range j.Metadata.OwnerReferences {
+					if owner.Kind == "CronJob" && owner.Name != "" {
+						cronOwner = j.Metadata.Namespace + "/" + owner.Name
+						break
+					}
 				}
+				entry := jobEntry{key: key, createdAt: createdAt, failed: j.Status.Failed}
+				if cronOwner != "" {
+					prev, exists := cronLatest[cronOwner]
+					if !exists || createdAt.After(prev.createdAt) || (createdAt.Equal(prev.createdAt) && key > prev.key) {
+						cronLatest[cronOwner] = entry
+					}
+				} else if entry.failed > 0 {
+					failedJobs = append(failedJobs, entry)
+				}
+			}
+			for _, latest := range cronLatest {
+				if latest.failed > 0 {
+					failedJobs = append(failedJobs, latest)
+				}
+			}
+			sort.Slice(failedJobs, func(i, j int) bool {
+				return failedJobs[i].key < failedJobs[j].key
+			})
+			for _, fj := range failedJobs {
+				foundIssue = true
+				fmt.Fprintf(b, "- Job %s: failed=%d\n", fj.key, fj.failed)
 			}
 		}
 	}

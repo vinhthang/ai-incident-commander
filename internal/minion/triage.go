@@ -10,6 +10,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 
+	"vinhthang.dev/ai-incident-commander/internal/k8s"
 	"vinhthang.dev/ai-incident-commander/internal/prompt"
 )
 
@@ -22,20 +23,20 @@ const (
 	ActionIgnore        TriageAction = "IGNORE"
 	ActionEscalateHuman TriageAction = "ESCALATE_HUMAN"
 	ActionFixViaPR      TriageAction = "FIX_VIA_PR"
+	ActionFixRuntime    TriageAction = "FIX_RUNTIME"
 )
 
-// TriageResult captures the structured triage conclusion, confidence, and raw report.
+// TriageResult captures the structured triage conclusion, confidence, optional runtime action, and raw report.
 type TriageResult struct {
-	Action     TriageAction
-	Confidence string
-	Summary    string
-	Err        error
+	Action        TriageAction
+	Confidence    string
+	RuntimeAction *k8s.RuntimeAction
+	Summary       string
+	Err           error
 }
 
-// ParseTriageDecision extracts the final verdict and Confidence level from triage output.
-// If FIX_VIA_PR is requested without HIGH confidence, it safely downgrades to ESCALATE_HUMAN.
-// Any ambiguous or unrecognized output defaults safely to ESCALATE_HUMAN.
-func ParseTriageDecision(output string) (TriageAction, string) {
+// ParseTriageOutcome extracts verdict, confidence level, and validated RuntimeAction (when FIX_RUNTIME).
+func ParseTriageOutcome(output string) (TriageAction, string, *k8s.RuntimeAction) {
 	confidence := extractConfidence(output)
 
 	lines := strings.Split(strings.TrimSpace(output), "\n")
@@ -47,19 +48,54 @@ func ParseTriageDecision(output string) (TriageAction, string) {
 		cleaned := strings.ToUpper(strings.TrimSpace(strings.Trim(line, "`*#_ ")))
 		switch cleaned {
 		case "VERDICT: IGNORE", "IGNORED":
-			return ActionIgnore, confidence
+			return ActionIgnore, confidence, nil
 		case "VERDICT: ESCALATE_HUMAN":
-			return ActionEscalateHuman, confidence
+			return ActionEscalateHuman, confidence, nil
 		case "VERDICT: FIX_VIA_PR":
 			if confidence == "HIGH" {
-				return ActionFixViaPR, confidence
+				return ActionFixViaPR, confidence, nil
 			}
-			return ActionEscalateHuman, confidence
+			return ActionEscalateHuman, confidence, nil
+		case "VERDICT: FIX_RUNTIME":
+			if confidence == "HIGH" {
+				if act := extractRuntimeAction(output); act != nil {
+					return ActionFixRuntime, confidence, act
+				}
+			}
+			return ActionEscalateHuman, confidence, nil
 		default:
-			return ActionEscalateHuman, confidence
+			return ActionEscalateHuman, confidence, nil
 		}
 	}
-	return ActionEscalateHuman, confidence
+	return ActionEscalateHuman, confidence, nil
+}
+
+// ParseTriageDecision extracts the final verdict and Confidence level from triage output.
+// If FIX_VIA_PR or FIX_RUNTIME is requested without HIGH confidence (or valid runtime target),
+// it safely downgrades to ESCALATE_HUMAN.
+func ParseTriageDecision(output string) (TriageAction, string) {
+	action, confidence, _ := ParseTriageOutcome(output)
+	return action, confidence
+}
+
+func extractRuntimeAction(output string) *k8s.RuntimeAction {
+	for _, line := range strings.Split(output, "\n") {
+		stripped := strings.NewReplacer("*", "", "`", "").Replace(strings.TrimSpace(line))
+		stripped = strings.TrimLeft(stripped, "- ")
+		if len(stripped) < len("RUNTIME_ACTION:") {
+			continue
+		}
+		if !strings.EqualFold(stripped[:len("RUNTIME_ACTION:")], "RUNTIME_ACTION:") {
+			continue
+		}
+		spec := strings.TrimSpace(stripped[len("RUNTIME_ACTION:"):])
+		act, err := k8s.ParseRuntimeActionSpec(spec)
+		if err != nil {
+			return nil
+		}
+		return &act
+	}
+	return nil
 }
 
 func extractConfidence(output string) string {
@@ -127,16 +163,20 @@ func RunDiagnosticTriage(ctx context.Context, alertName string, labels, annotati
 		}
 	}
 
-	action, confidence := ParseTriageDecision(result.Stdout)
+	action, confidence, runtimeAct := ParseTriageOutcome(result.Stdout)
 	span.SetAttributes(
 		attribute.String("triage.verdict", string(action)),
 		attribute.String("triage.confidence", confidence),
 	)
+	if runtimeAct != nil {
+		span.SetAttributes(attribute.String("triage.runtime_target", runtimeAct.TargetString()))
+	}
 
 	return TriageResult{
-		Action:     action,
-		Confidence: confidence,
-		Summary:    result.Stdout,
+		Action:        action,
+		Confidence:    confidence,
+		RuntimeAction: runtimeAct,
+		Summary:       result.Stdout,
 	}
 }
 

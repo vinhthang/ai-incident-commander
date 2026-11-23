@@ -190,3 +190,93 @@ func TestParseTriageDecision(t *testing.T) {
 		})
 	}
 }
+
+func TestParseTriageDecision_FixRuntime(t *testing.T) {
+	tests := []struct {
+		name               string
+		input              string
+		expectedAction     TriageAction
+		expectedConfidence string
+		expectRuntime      bool
+		expectTarget       string
+	}{
+		{
+			name: "HIGH confidence with valid ROLLOUT_RESTART triggers FIX_RUNTIME",
+			input: "## Diagnostic Report\n" +
+				"**Root Cause Conclusion**: Grafana SQLite lock deadlocked process.\n" +
+				"**Confidence**: HIGH\n" +
+				"RUNTIME_ACTION: ROLLOUT_RESTART observability/deployment/grafana\n\n" +
+				"VERDICT: FIX_RUNTIME",
+			expectedAction:     ActionFixRuntime,
+			expectedConfidence: "HIGH",
+			expectRuntime:      true,
+			expectTarget:       "observability/deployment/grafana",
+		},
+		{
+			name: "HIGH confidence with valid DELETE_FAILED_JOB triggers FIX_RUNTIME",
+			input: "## Diagnostic Report\n" +
+				"**Confidence**: HIGH\n" +
+				"**RUNTIME_ACTION**: `DELETE_FAILED_JOB system/job/daily-report-29918895`\n\n" +
+				"VERDICT: FIX_RUNTIME",
+			expectedAction:     ActionFixRuntime,
+			expectedConfidence: "HIGH",
+			expectRuntime:      true,
+			expectTarget:       "system/job/daily-report-29918895",
+		},
+		{
+			name: "MEDIUM confidence downgrades FIX_RUNTIME to ESCALATE_HUMAN",
+			input: "## Diagnostic Report\n" +
+				"**Confidence**: MEDIUM\n" +
+				"RUNTIME_ACTION: ROLLOUT_RESTART observability/deployment/grafana\n\n" +
+				"VERDICT: FIX_RUNTIME",
+			expectedAction:     ActionEscalateHuman,
+			expectedConfidence: "MEDIUM",
+		},
+		{
+			name: "missing RUNTIME_ACTION downgrades FIX_RUNTIME to ESCALATE_HUMAN",
+			input: "## Diagnostic Report\n" +
+				"**Confidence**: HIGH\n\n" +
+				"VERDICT: FIX_RUNTIME",
+			expectedAction:     ActionEscalateHuman,
+			expectedConfidence: "HIGH",
+		},
+		{
+			name: "protected namespace runtime target downgrades FIX_RUNTIME to ESCALATE_HUMAN",
+			input: "## Diagnostic Report\n" +
+				"**Confidence**: HIGH\n" +
+				"RUNTIME_ACTION: ROLLOUT_RESTART data/statefulset/mongodb-rs0\n\n" +
+				"VERDICT: FIX_RUNTIME",
+			expectedAction:     ActionEscalateHuman,
+			expectedConfidence: "HIGH",
+		},
+		{
+			name: "self target runtime action downgrades FIX_RUNTIME to ESCALATE_HUMAN",
+			input: "## Diagnostic Report\n" +
+				"**Confidence**: HIGH\n" +
+				"RUNTIME_ACTION: ROLLOUT_RESTART system/deployment/ai-incident-commander\n\n" +
+				"VERDICT: FIX_RUNTIME",
+			expectedAction:     ActionEscalateHuman,
+			expectedConfidence: "HIGH",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			action, confidence, rtAct := ParseTriageOutcome(tc.input)
+			if action != tc.expectedAction || confidence != tc.expectedConfidence {
+				t.Errorf("ParseTriageOutcome() = (%q, %q), expected (%q, %q)",
+					action, confidence, tc.expectedAction, tc.expectedConfidence)
+			}
+			if tc.expectRuntime {
+				if rtAct == nil {
+					t.Fatalf("expected non-nil RuntimeAction, got nil")
+				}
+				if rtAct.TargetString() != tc.expectTarget {
+					t.Errorf("RuntimeAction.TargetString() = %q, want %q", rtAct.TargetString(), tc.expectTarget)
+				}
+			} else if rtAct != nil {
+				t.Errorf("expected nil RuntimeAction on downgraded verdict, got %+v", rtAct)
+			}
+		})
+	}
+}

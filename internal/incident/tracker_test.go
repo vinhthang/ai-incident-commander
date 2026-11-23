@@ -1,6 +1,8 @@
 package incident
 
 import (
+	"context"
+	"errors"
 	"testing"
 )
 
@@ -339,4 +341,48 @@ func TestNormalizeWorkloadBase(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestReconcileClosedClusterIssue(t *testing.T) {
+	t.Run("no issue number or nil lookup conservatively suppresses", func(t *testing.T) {
+		if !ReconcileClosedClusterIssue(context.Background(), "fp-1", 0, func(context.Context, int) (bool, error) {
+			t.Fatal("should not call isOpenFn when existingIssue <= 0")
+			return false, nil
+		}) {
+			t.Fatalf("expected true when existingIssue <= 0")
+		}
+		if !ReconcileClosedClusterIssue(context.Background(), "fp-1", 339, nil) {
+			t.Fatalf("expected true when isOpenFn is nil")
+		}
+	})
+
+	t.Run("open issue keeps duplicate suppression", func(t *testing.T) {
+		if !ReconcileClosedClusterIssue(context.Background(), "fp-1", 344, func(ctx context.Context, n int) (bool, error) {
+			return true, nil
+		}) {
+			t.Fatalf("expected true when GitHub issue is still open")
+		}
+	})
+
+	t.Run("API error conservatively keeps duplicate suppression", func(t *testing.T) {
+		if !ReconcileClosedClusterIssue(context.Background(), "fp-1", 339, func(ctx context.Context, n int) (bool, error) {
+			return false, errors.New("rate limited")
+		}) {
+			t.Fatalf("expected true when GitHub API returns an error")
+		}
+	})
+
+	t.Run("closed issue clears stale firing state and returns false", func(t *testing.T) {
+		var checkedIssue int
+		stillOpen := ReconcileClosedClusterIssue(context.Background(), "fp-1", 339, func(ctx context.Context, n int) (bool, error) {
+			checkedIssue = n
+			return false, nil
+		})
+		if checkedIssue != 339 {
+			t.Fatalf("expected issue #339 checked, got %d", checkedIssue)
+		}
+		if stillOpen {
+			t.Fatalf("expected stillOpen=false when GitHub issue is closed")
+		}
+	})
 }

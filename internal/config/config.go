@@ -21,6 +21,13 @@ var (
 	AutoMerge          = ParseBoolEnv("AUTO_MERGE", false)
 	MemosDBDSN         = os.Getenv("MEMOS_DB_DSN")
 	VictoriaMetricsURL = GetEnv("VICTORIAMETRICS_URL", "http://victoriametrics.observability.svc.cluster.local:8428")
+	VictoriaLogsURL    = GetEnv("VICTORIALOGS_URL", "http://victorialogs.observability.svc.cluster.local:9428")
+
+	EnableRuntimeRemediation   = ParseBoolEnv("ENABLE_RUNTIME_REMEDIATION", true)
+	RuntimeProtectedNamespaces = ParseCSVEnv("RUNTIME_PROTECTED_NAMESPACES", []string{"kube-system", "kube-public", "kube-node-lease", "data"})
+	RuntimeVerifyTimeout       = ParseDurationEnv("RUNTIME_VERIFY_TIMEOUT", 90*time.Second)
+	EnableDailyProactiveFix    = ParseBoolEnv("ENABLE_DAILY_PROACTIVE_FIX", true)
+	DailyMaxProactiveFixes     = ParseIntEnv("DAILY_MAX_PROACTIVE_FIXES", 3)
 
 	WorkspaceDir = GetEnv("WORKSPACE_DIR", "/app/workspace/oci")
 	CooldownMins = 5 * time.Minute
@@ -57,4 +64,34 @@ func ParseBoolEnv(key string, defaultVal bool) bool {
 		return defaultVal
 	}
 	return parsed
+}
+
+// ParseIntEnv parses a non-negative integer env var, returning defaultVal when unset or invalid.
+func ParseIntEnv(key string, defaultVal int) int {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return defaultVal
+	}
+	parsed, err := strconv.Atoi(raw)
+	if err != nil || parsed < 0 {
+		return defaultVal
+	}
+	return parsed
+}
+
+// ParseCSVEnv parses a comma-separated env var into trimmed non-empty lowercase tokens.
+func ParseCSVEnv(key string, defaultVal []string) []string {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		out := make([]string, len(defaultVal))
+		copy(out, defaultVal)
+		return out
+	}
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		if trimmed := strings.ToLower(strings.TrimSpace(part)); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
 }
