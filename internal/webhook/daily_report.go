@@ -36,8 +36,8 @@ var (
 	}
 )
 
-// HandleDailyReport triggers an asynchronous read-only agy fleet check and publishes
-// the report to Memos and GitHub Issues, dispatching bounded proactive remediations if enabled.
+// HandleDailyReport triggers an asynchronous read-only agy fleet check, publishes
+// the report to Memos (#DailyFleetCheck), and dispatches bounded proactive remediations if enabled.
 func HandleDailyReport(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -69,6 +69,18 @@ func HandleDailyReport(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func deliverDailyMemosNote(ctx context.Context, dateStr, statusLabel, body string) {
+	if config.MemosDBDSN == "" {
+		return
+	}
+	note := db.FormatDailyMemosNote(dateStr, statusLabel, body)
+	if err := memosInsertFn(ctx, config.MemosDBDSN, note, false); err != nil {
+		log.Printf("⚠️ Failed inserting daily report (%s) into Memos: %v", statusLabel, err)
+		return
+	}
+	log.Printf("📝 Daily fleet report (%s, %s) delivered to Memos.", dateStr, statusLabel)
+}
+
 func executeDailyReport(ctx context.Context) {
 	ict := time.FixedZone("ICT", 7*3600)
 	dateStr := time.Now().In(ict).Format("2006-01-02")
@@ -80,13 +92,8 @@ func executeDailyReport(ctx context.Context) {
 	if err != nil {
 		metrics.IncDailyReport("error")
 		log.Printf("🚨 Daily fleet report failed: %v", err)
-		if github.Client != nil {
-			title := fmt.Sprintf("[Daily Fleet Check] %s (ERROR)", dateStr)
-			body := fmt.Sprintf("## Daily Fleet Check Error (%s)\n\nError running `agy` audit: `%v`\n\n### Collected Snapshot\n```text\n%s\n```", dateStr, err, snapshot)
-			if issue, issueErr := github.CreateIssue(ctx, title, body, []string{"daily-report", "needs-human-review"}); issueErr == nil && issue != nil {
-				_ = github.AssignIssueOrPR(ctx, issue.GetNumber(), config.GithubOwner)
-			}
-		}
+		errBody := fmt.Sprintf("## Daily Fleet Check Error (%s)\n\nError running `agy` audit: `%v`\n\n### Collected Snapshot\n```text\n%s\n```", dateStr, err, snapshot)
+		deliverDailyMemosNote(ctx, dateStr, "ERROR", errBody)
 		return
 	}
 
@@ -100,45 +107,14 @@ func executeDailyReport(ctx context.Context) {
 		metrics.IncDailyReport("attention_needed")
 	}
 
-	if config.MemosDBDSN != "" {
-		note := db.FormatDailyMemosNote(dateStr, statusLabel, cleanReport)
-		if err := memosInsertFn(ctx, config.MemosDBDSN, note, false); err != nil {
-			log.Printf("⚠️ Failed inserting daily report into Memos: %v", err)
-		} else {
-			log.Printf("📝 Daily fleet report (%s) delivered to Memos.", dateStr)
+	finalReport := cleanReport
+	if config.EnableDailyProactiveFix && config.DailyMaxProactiveFixes > 0 && len(proactiveActions) > 0 {
+		if summary := dispatchDailyProactiveFixes(ctx, dateStr, proactiveActions); summary != "" {
+			finalReport = strings.TrimSpace(cleanReport) + "\n\n" + summary
 		}
 	}
 
-	dailyIssueNum := 0
-	if github.Client != nil {
-		title := fmt.Sprintf("[Daily Fleet Check] %s (%s)", dateStr, statusLabel)
-		labels := []string{"daily-report"}
-		if !healthy {
-			labels = append(labels, "needs-human-review")
-		}
-		issue, issueErr := github.CreateIssue(ctx, title, cleanReport, labels)
-		if issueErr != nil {
-			log.Printf("⚠️ Failed creating daily report GitHub issue: %v", issueErr)
-		} else if issue != nil {
-			dailyIssueNum = issue.GetNumber()
-			if !healthy {
-				_ = github.AssignIssueOrPR(ctx, dailyIssueNum, config.GithubOwner)
-			}
-		}
-	}
-
-	willDispatch := config.EnableDailyProactiveFix && config.DailyMaxProactiveFixes > 0 && len(proactiveActions) > 0
-	if willDispatch {
-		if summary := dispatchDailyProactiveFixes(ctx, dateStr, proactiveActions); summary != "" && dailyIssueNum > 0 && github.Client != nil {
-			_ = github.AddIssueComment(ctx, dailyIssueNum, summary)
-		}
-	}
-
-	if healthy && dailyIssueNum > 0 && github.Client != nil {
-		if closeErr := github.CloseIssue(ctx, dailyIssueNum, "✅ Daily fleet audit reported HEALTHY. Auto-closing; full report archived in Memos."); closeErr != nil {
-			log.Printf("⚠️ Failed auto-closing healthy daily report issue #%d: %v", dailyIssueNum, closeErr)
-		}
-	}
+	deliverDailyMemosNote(ctx, dateStr, statusLabel, finalReport)
 }
 
 func dispatchDailyProactiveFixes(ctx context.Context, dateStr string, actions []minion.DailyProactiveAction) string {
@@ -179,7 +155,7 @@ func dispatchSingleProactiveFix(ctx context.Context, dateStr, workloadBase strin
 			title := fmt.Sprintf("[Proactive Runtime Fix] %s (%s)", target, dateStr)
 			body := fmt.Sprintf("## Proactive Daily Audit Runtime Fix\n\n- **Target**: `%s`\n- **Action**: `%s`\n- **Root Cause**: %s",
 				target, act.RuntimeAction.Type, act.Diagnosis)
-			issue, err := github.CreateIssue(ctx, title, body, []string{"ai-incident", "daily-report"})
+			issue, err := github.CreateIssue(ctx, title, body, []string{"ai-incident", "proactive-fix"})
 			if err != nil {
 				log.Printf("⚠️ Failed creating proactive runtime issue for %s: %v", target, err)
 			} else if issue != nil {
@@ -220,7 +196,7 @@ func dispatchSingleProactiveFix(ctx context.Context, dateStr, workloadBase strin
 		title := fmt.Sprintf("[Proactive Fix] %s (%s)", targetLabel, dateStr)
 		body := fmt.Sprintf("## Proactive Daily Audit GitOps Fix\n\n- **Target**: `%s`\n- **Root Cause**: %s\n\n<details>\n<summary>Collected Diagnostic Telemetry</summary>\n\n```text\n%s\n```\n</details>",
 			targetLabel, act.Diagnosis, telemetry)
-		issue, err := github.CreateIssue(ctx, title, body, []string{"ai-incident", "daily-report"})
+		issue, err := github.CreateIssue(ctx, title, body, []string{"ai-incident", "proactive-fix"})
 		if err != nil {
 			log.Printf("⚠️ Failed creating proactive PR tracking issue for %s: %v", targetLabel, err)
 			metrics.IncProactiveFix("pr", "issue_error")

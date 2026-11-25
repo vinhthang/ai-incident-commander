@@ -4,7 +4,7 @@
 - Type: enhancement
 - Status: In-Testing
 - First entered In-Testing: 2026-11-23
-- Related specifications: Implemented: Changes [2026-11-22-commander-reliability-and-observability](../2026-11-22-commander-reliability-and-observability/spec.md)
+- Related specifications: Implemented: Changes [2026-11-22-commander-reliability-and-observability](../2026-11-22-commander-reliability-and-observability/spec.md); Changed by [2026-11-25-daily-report-memos-only](../2026-11-25-daily-report-memos-only/spec.md)
 
 ## Problem and source intent
 
@@ -51,6 +51,7 @@ Previously, `/daily-report` was strictly read-only (`executeDailyReport` never d
 
 ### REQ-026: Proactive Remediation Dispatch from Daily Fleet Audits
 
+- Current contract: Changed by [2026-11-25-daily-report-memos-only/REQ-029](../2026-11-25-daily-report-memos-only/spec.md#req-029-memos-only-daily-fleet-reports-without-github-report-issues)
 - Changes: [2026-11-22-commander-reliability-and-observability/REQ-022](../2026-11-22-commander-reliability-and-observability/spec.md#req-022-signal-clean-daily-fleet-snapshot-filtering)
 - Source intent: User selection A1 (`"Proactive fixes from /daily-report findings (auto-dispatch verified root-cause issues from daily audits instead of only listing recommendations)"`).
 - Previous contract: `executeDailyReport` ran a single read-only audit pass, published the Markdown report to Memos/GitHub, and exited without dispatching any fixes for discovered root causes.
@@ -87,3 +88,4 @@ Previously, `/daily-report` was strictly read-only (`executeDailyReport` never d
 - **2026-11-23 (`Planning`)**: Linked delta package authored from user request (`"I want to modify this ai commander to fix other issues as well, if it can see the root cause, then it can fix. just report back the result"`) and explicit multiple-choice answers (A1 proactive daily fixes, A2 env-controlled `AUTO_MERGE`, A3 Go-enforced runtime allowlist, A4 GitHub + Memos `#AutoRemediation`). Implementation awaiting human review/approval of `implementation_plan.md`.
 - **2026-11-23 (`Planning -> In-Progress`)**: User approved `implementation_plan.md` (`"proceed"`). Starting TDD execution of Tasks 1–5.
 - **2026-11-23 (`In-Progress -> In-Testing`)**: Completed Tasks 1–5 with `go test -count=1 ./...`, `go vet ./...`, `golangci-lint run ./...`, multi-arch static builds, `arch-guard`, `mutation-guard`, and `code-review` passing ([Run 1](./verification.md#run-1--2026-11-23)); promoted to `In-Testing` awaiting live cluster RBAC application and real-world verification.
+- **2026-11-25 (`In-Testing` parent activation)**: Linked delta [2026-11-25-daily-report-memos-only](../2026-11-25-daily-report-memos-only/spec.md) (`REQ-029`) entered `In-Testing`; added 1-hop `- Current contract:` link on `REQ-026`.

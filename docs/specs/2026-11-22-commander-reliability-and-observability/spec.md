@@ -67,7 +67,7 @@ The user reviewed the 10 Tier 1–3 improvement proposals grounded in codebase i
 
 ### REQ-022: Signal-Clean Daily Fleet Snapshot Filtering
 
-- Current contract: Changed by [2026-11-23-autonomous-remediation-and-proactive-audit/REQ-026](../2026-11-23-autonomous-remediation-and-proactive-audit/spec.md#req-026-proactive-remediation-dispatch-from-daily-fleet-audits)
+- Current contract: Changed by [2026-11-25-daily-report-memos-only/REQ-029](../2026-11-25-daily-report-memos-only/spec.md#req-029-memos-only-daily-fleet-reports-without-github-report-issues)
 - Changes: [2026-11-22-ai-incident-commander-baseline/REQ-016](../2026-11-22-ai-incident-commander-baseline/spec.md#req-016-single-flight-daily-fleet-health-audit-and-multi-sink-publishing)
 - Source intent: User authorization (`"proceed all of them"`) on Tier 1 Item 1 derived from live `arm10` `ai-commander-daily-report` behavior in Issue `#344`.
 - Previous contract: `CollectDailyFleetSnapshot` flagged its own transient `ai-commander-daily-report` trigger pod, flagged historical failed `CronJob` child `Job`s even after newer runs succeeded, and treated all-time `restartCount > 0` identically to active crash loops.
@@ -96,3 +96,4 @@ The user reviewed the 10 Tier 1–3 improvement proposals grounded in codebase i
 - **2026-11-22 (`Planning -> In-Progress`)**: Gate 1 and Gate 2 passed; user authorized all 10 improvements (`"proceed all of them"`). Starting TDD execution of Tasks 1–5.
 - **2026-11-22 (`In-Progress -> In-Testing`)**: Completed Tasks 1–5 with `go test -v -count=1 ./...`, `go vet ./...`, static build, `arch-guard`, `mutation-guard`, and `code-review` passing ([Run 1](./verification.md#run-1--2026-11-22)); promoted to `In-Testing` awaiting real-world cluster confirmation.
 - **2026-11-23 (`In-Testing` parent activation)**: Linked delta [2026-11-23-autonomous-remediation-and-proactive-audit](../2026-11-23-autonomous-remediation-and-proactive-audit/spec.md) (`REQ-024..REQ-028`) entered `In-Testing`; added 1-hop `- Current contract:` links on `REQ-018`, `REQ-020`, `REQ-021`, `REQ-022`, and `REQ-023`.
+- **2026-11-25 (`In-Testing` chain activation)**: Linked delta [2026-11-25-daily-report-memos-only](../2026-11-25-daily-report-memos-only/spec.md) (`REQ-029`) entered `In-Testing`; updated 1-hop `- Current contract:` link on `REQ-022`.
